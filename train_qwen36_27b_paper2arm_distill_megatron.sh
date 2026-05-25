@@ -43,6 +43,10 @@ SEQUENCE_PARALLEL="${SEQUENCE_PARALLEL:-true}"
 OPTIMIZER_CPU_OFFLOAD="${OPTIMIZER_CPU_OFFLOAD:-true}"
 OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-1}"
 USE_PRECISION_AWARE_OPTIMIZER="${USE_PRECISION_AWARE_OPTIMIZER:-true}"
+MAIN_GRADS_DTYPE="${MAIN_GRADS_DTYPE:-fp32}"
+MAIN_PARAMS_DTYPE="${MAIN_PARAMS_DTYPE:-fp32}"
+EXP_AVG_DTYPE="${EXP_AVG_DTYPE:-fp32}"
+EXP_AVG_SQ_DTYPE="${EXP_AVG_SQ_DTYPE:-fp32}"
 
 if [[ "${SMOKE}" == "1" ]]; then
   MAX_LENGTH="${MAX_LENGTH:-4096}"
@@ -73,11 +77,35 @@ LAZY_TOKENIZE="${LAZY_TOKENIZE:-false}"
 LOAD_FROM_CACHE_FILE="${LOAD_FROM_CACHE_FILE:-true}"
 SPLIT_DATASET_RATIO="${SPLIT_DATASET_RATIO:-0}"
 RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-full}"
-RECOMPUTE_METHOD="${RECOMPUTE_METHOD:-uniform}"
-RECOMPUTE_NUM_LAYERS="${RECOMPUTE_NUM_LAYERS:-1}"
+if [[ -z "${RECOMPUTE_METHOD+x}" ]]; then
+  if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
+    RECOMPUTE_METHOD="uniform"
+  else
+    RECOMPUTE_METHOD=""
+  fi
+fi
+if [[ -z "${RECOMPUTE_NUM_LAYERS+x}" ]]; then
+  if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
+    RECOMPUTE_NUM_LAYERS="1"
+  else
+    RECOMPUTE_NUM_LAYERS=""
+  fi
+fi
+RECOMPUTE_MODULES="${RECOMPUTE_MODULES:-}"
 CROSS_ENTROPY_LOSS_FUSION="${CROSS_ENTROPY_LOSS_FUSION:-true}"
 LINEAR_CE_CHUNK_SIZE="${LINEAR_CE_CHUNK_SIZE:-2048}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+TP_COMM_OVERLAP="${TP_COMM_OVERLAP:-false}"
+OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-false}"
+OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-false}"
+OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP="${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP:-false}"
+GRADIENT_ACCUMULATION_FUSION="${GRADIENT_ACCUMULATION_FUSION:-false}"
+DATA_SHARDING="${DATA_SHARDING:-false}"
+GROUP_BY_LENGTH="${GROUP_BY_LENGTH:-false}"
+FP8_FORMAT="${FP8_FORMAT:-}"
+FP8_RECIPE="${FP8_RECIPE:-delayed}"
+FP8_PARAM_GATHER="${FP8_PARAM_GATHER:-false}"
+ASYNC_SAVE="${ASYNC_SAVE:-false}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
 DDP_TIMEOUT="${DDP_TIMEOUT:-3600000}"
@@ -98,6 +126,11 @@ DATA_PARALLEL_SIZE=$((NPROC_PER_NODE / TOTAL_MODEL_PARALLEL))
 if (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * DATA_PARALLEL_SIZE) != 0 )); then
   echo "ERROR: GLOBAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE*DATA_PARALLEL_SIZE." >&2
   echo "       GLOBAL=${GLOBAL_BATCH_SIZE} MICRO=${MICRO_BATCH_SIZE} DP=${DATA_PARALLEL_SIZE}" >&2
+  exit 1
+fi
+if [[ "${GROUP_BY_LENGTH}" == "true" && "${PADDING_FREE}" == "true" ]]; then
+  echo "ERROR: Megatron group_by_length is not compatible with padding_free=true." >&2
+  echo "       Set PADDING_FREE=false if you explicitly want to test GROUP_BY_LENGTH=true." >&2
   exit 1
 fi
 
@@ -150,10 +183,9 @@ cmd=(
   --padding_free "${PADDING_FREE}"
   --lazy_tokenize "${LAZY_TOKENIZE}"
   --recompute_granularity "${RECOMPUTE_GRANULARITY}"
-  --recompute_method "${RECOMPUTE_METHOD}"
-  --recompute_num_layers "${RECOMPUTE_NUM_LAYERS}"
   --finetune true
   --cross_entropy_loss_fusion "${CROSS_ENTROPY_LOSS_FUSION}"
+  --gradient_accumulation_fusion "${GRADIENT_ACCUMULATION_FUSION}"
   --lr "${LR}"
   --lr_warmup_fraction "${LR_WARMUP_FRACTION}"
   --min_lr "${MIN_LR}"
@@ -166,15 +198,40 @@ cmd=(
   --dataset_num_proc "${DATASET_NUM_PROC}"
   --no_save_optim true
   --no_save_rng true
+  --async_save "${ASYNC_SAVE}"
   --sequence_parallel "${SEQUENCE_PARALLEL}"
   --optimizer_cpu_offload "${OPTIMIZER_CPU_OFFLOAD}"
   --use_precision_aware_optimizer "${USE_PRECISION_AWARE_OPTIMIZER}"
   --optimizer_offload_fraction "${OPTIMIZER_OFFLOAD_FRACTION}"
+  --main_grads_dtype "${MAIN_GRADS_DTYPE}"
+  --main_params_dtype "${MAIN_PARAMS_DTYPE}"
+  --exp_avg_dtype "${EXP_AVG_DTYPE}"
+  --exp_avg_sq_dtype "${EXP_AVG_SQ_DTYPE}"
+  --tp_comm_overlap "${TP_COMM_OVERLAP}"
+  --overlap_grad_reduce "${OVERLAP_GRAD_REDUCE}"
+  --overlap_param_gather "${OVERLAP_PARAM_GATHER}"
+  --overlap_param_gather_with_optimizer_step "${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP}"
+  --data_sharding "${DATA_SHARDING}"
+  --group_by_length "${GROUP_BY_LENGTH}"
   --attention_backend "${ATTENTION_BACKEND}"
   --report_to "${REPORT_TO}"
   --ddp_timeout "${DDP_TIMEOUT}"
 )
 
+if [[ -n "${RECOMPUTE_METHOD}" ]]; then
+  cmd+=(--recompute_method "${RECOMPUTE_METHOD}")
+fi
+if [[ -n "${RECOMPUTE_NUM_LAYERS}" ]]; then
+  cmd+=(--recompute_num_layers "${RECOMPUTE_NUM_LAYERS}")
+fi
+if [[ -n "${RECOMPUTE_MODULES}" ]]; then
+  # shellcheck disable=SC2206
+  recompute_modules_array=(${RECOMPUTE_MODULES})
+  cmd+=(--recompute_modules "${recompute_modules_array[@]}")
+fi
+if [[ -n "${FP8_FORMAT}" ]]; then
+  cmd+=(--fp8_format "${FP8_FORMAT}" --fp8_recipe "${FP8_RECIPE}" --fp8_param_gather "${FP8_PARAM_GATHER}")
+fi
 if [[ -n "${TRAIN_ITERS}" ]]; then
   cmd+=(--train_iters "${TRAIN_ITERS}")
 fi
@@ -193,8 +250,15 @@ fi
   echo "Truncation strategy: ${TRUNCATION_STRATEGY}"
   echo "TP/PP/CP/DP: ${TENSOR_MODEL_PARALLEL_SIZE}/${PIPELINE_MODEL_PARALLEL_SIZE}/${CONTEXT_PARALLEL_SIZE}/${DATA_PARALLEL_SIZE}"
   echo "Optimizer CPU offload: ${OPTIMIZER_CPU_OFFLOAD} fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
+  echo "Precision-aware optimizer: ${USE_PRECISION_AWARE_OPTIMIZER} main_grads=${MAIN_GRADS_DTYPE} main_params=${MAIN_PARAMS_DTYPE} exp_avg=${EXP_AVG_DTYPE} exp_avg_sq=${EXP_AVG_SQ_DTYPE}"
   echo "Cross entropy loss fusion: ${CROSS_ENTROPY_LOSS_FUSION}"
   echo "Chunked linear CE chunk size: ${LINEAR_CE_CHUNK_SIZE}"
+  echo "Recompute: granularity=${RECOMPUTE_GRANULARITY} method=${RECOMPUTE_METHOD} num_layers=${RECOMPUTE_NUM_LAYERS} modules=${RECOMPUTE_MODULES:-<default>}"
+  echo "Overlap: tp_comm=${TP_COMM_OVERLAP} grad_reduce=${OVERLAP_GRAD_REDUCE} param_gather=${OVERLAP_PARAM_GATHER} param_gather_with_step=${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP}"
+  echo "Data: data_sharding=${DATA_SHARDING} group_by_length=${GROUP_BY_LENGTH} padding_free=${PADDING_FREE}"
+  echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER}"
+  echo "Gradient accumulation fusion: ${GRADIENT_ACCUMULATION_FUSION}"
+  echo "Async save: ${ASYNC_SAVE}"
   echo "LR/min_lr/warmup: ${LR}/${MIN_LR}/${LR_WARMUP_FRACTION}"
   echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
   echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
