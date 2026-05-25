@@ -409,6 +409,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     optimizer: Literal['adam', 'sgd', 'muon', 'dist_muon'] = 'adam'
     optimizer_cpu_offload: bool = False
     optimizer_offload_fraction: float = 1.
+    use_torch_optimizer_for_cpu_offload: bool = False
+    overlap_cpu_optimizer_d2h_h2d: bool = False
+    pin_cpu_grads: bool = True
+    pin_cpu_params: bool = True
     use_precision_aware_optimizer: bool = False
     main_grads_dtype: Literal['fp32', 'bf16'] = 'fp32'
     main_params_dtype: Literal['fp32', 'fp16'] = 'fp32'

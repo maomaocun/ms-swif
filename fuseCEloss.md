@@ -13,6 +13,7 @@
 - 已在本机 `.venv-megatron` 运行环境里实现了一个 chunked linear CE 路径，用 `LINEAR_CE_CHUNK_SIZE=2048` 控制。
 - 该实现按扁平 token 维度切块，临时 logits 形状为 `[<=2048, vocab/TP]`，不是 `[batch, seq, vocab/TP]` 全量 logits。
 - 4K smoke run 已确认命中 chunked linear CE 分支，loss 正常。
+- 2026-05-25 重新跑了当前脚本的真实 Megatron SFT smoke：`verify-sft-chunkce-20260525-202158`。这次日志同时确认了 SFT mask 与 chunk CE 命中：4096 tokens 中 `ignore(-100)=3551`、`supervised=545`、`first_supervised_index=3366`，并打印 `[INFO:mcore_bridge] Using chunked linear CE loss with LINEAR_CE_CHUNK_SIZE=2048.`；训练 step 正常完成，loss 为 `0.29145688`。
 - 256K run 已使用相同环境变量配置，第一步 loss/grad 与原 baseline 基本一致，显存记录从 `53.84 GiB` 到 `53.24 GiB`，但 `train.log` 没搜到 chunked CE 分支命中日志，因此这次端到端训练的显存改善不能完全归因于 chunked CE。
 - 后续补充的单算子测试已经严格证明：只看 `hidden @ lm_head.T -> CE` 这段，chunked linear CE 有明确显存收益。262144 tokens 下 full logits + fp32 CE 路径在 A100 80G 上 OOM；即使不显式转 fp32、直接用 bf16 logits 做 CE，full 路径增量 peak allocated 也有 `60.63 GiB`，而 chunked 路径约 `4.17 GiB`。
 
@@ -85,6 +86,81 @@ SFT 训练继续使用：
 | assistant | token id | 是 |
 
 也就是说，模型学习的是“给定系统、用户、环境反馈等上下文后，assistant 应该输出什么”。环境返回的 bash 输出、tool response 不作为模型要生成的内容参与 loss。
+
+### 3.1 当前 SFT 路径复核
+
+这次复核目标是确认 chunked CE 不是只在单算子测试里成立，而是在 `megatron sft` 的真实 SFT 训练路径里保持 SFT loss 语义。
+
+运行命令：
+
+```bash
+RUN_NAME=verify-sft-chunkce-20260525-202158 \
+SMOKE=1 \
+LINEAR_CE_CHUNK_SIZE=2048 \
+bash train_qwen36_27b_paper2arm_distill_megatron.sh
+```
+
+日志路径：
+
+```text
+logs/qwen36-27b-paper2arm-distill-megatron/verify-sft-chunkce-20260525-202158/train.log
+outputs/qwen36-27b-paper2arm-distill-megatron/verify-sft-chunkce-20260525-202158/logging.jsonl
+```
+
+关键证据：
+
+```text
+[INFO:swift] [LABELS_IDS] {'summary': 'len=4096, omitted=3968, ignore(-100)=3551, supervised=545, first_supervised_index=3366', ...}
+[INFO:mcore_bridge] Using chunked linear CE loss with LINEAR_CE_CHUNK_SIZE=2048.
+{'loss': 0.29145688, 'grad_norm': 9.8802309, 'learning_rate': 1e-06, 'iteration': '1/1', 'memory(GiB)': 19.67, 'train_speed(s/it)': 99.010097}
+```
+
+代码路径确认：
+
+1. `swift/loss_scale/base.py` 中 `default` 策略只对 `ContextType.RESPONSE` / assistant suffix 给非零 loss scale，其余上下文为 0。
+2. 模板/tokenize 后的 labels 已体现 SFT mask：非监督 token 为 `-100`。
+3. `swift/megatron/trainers/utils.py` 在 causal LM 下对 labels 做 `torch.roll(..., -1)`，保持 next-token 预测对齐。
+4. `mcore_bridge.model.gpt_model._postprocess` 在 `labels is not None`、`task_type == causal_lm`、`LINEAR_CE_CHUNK_SIZE > 0`、非 inference 时直接返回 chunked linear CE 的 per-token loss，不再走完整 `output_layer -> logits -> compute_language_model_loss` 路径。
+5. `_ChunkedLinearCrossEntropy.forward` 内对 `target == -100` 的 token 输出 0 loss。
+6. `swift/megatron/trainers/trainer.py` 再用 `loss_mask = labels != -100` 聚合 loss，只除以 supervised token 数量。
+
+因此，这条路径确实是 SFT loss：上下文/user/tool/observation 不参与 loss，assistant 输出 token 参与 loss；chunked CE 只替换了 per-token CE 的计算方式，不改变 SFT mask 语义。
+
+### 3.2 单算子数值等价复核
+
+为了排除“训练日志命中了 chunk CE，但 chunk CE 本身改变了 SFT loss 语义”的风险，又用训练脚本同一套环境执行了一个小规模 autograd 等价测试。
+
+测试方式：
+
+- `source ./megatron_env.sh` 后导入当前运行环境中的 `_ChunkedLinearCrossEntropy`。
+- 构造 `[seq, batch, hidden]` hidden states、output weight 和 `[batch, seq]` labels。
+- labels 中手动设置大段 `-100`，模拟 SFT 中 system/user/tool/observation 被 mask、assistant suffix 被监督的情况。
+- 对比 chunk CE 与标准 `torch.nn.functional.cross_entropy(ignore_index=-100, reduction='none')`。
+- 聚合方式与 trainer 一致：`(losses * (labels != -100)).sum() / (labels != -100).sum()`。
+
+实测结果：
+
+```text
+python= /mnt/cpfs/yangyicun/innovator-agent/training/sft/ms-swift/.venv-megatron/bin/python
+torch= 2.6.0+cu126
+labels_shape= (3, 17)
+supervised_tokens= 20
+ignored_tokens= 31
+chunk_loss= 9.586441040039062
+standard_loss= 9.586441040039062
+max_per_token_loss_diff= 1.9073486328125e-06
+max_hidden_grad_diff= 2.9802322387695312e-08
+max_weight_grad_diff= 2.9802322387695312e-08
+ignored_chunk_loss_abs_sum= 0.0
+```
+
+这个测试说明：
+
+1. 在 `ignore_index=-100` 语义下，chunk CE 的 per-token loss 与标准 CE 数值一致，差异只在 float 误差级别。
+2. 被 SFT mask 掉的 token 在 chunk CE 中 loss 为 0。
+3. 对 hidden states 和 output weight 的反向梯度也与标准 CE 一致。
+
+结合 3.1 的真实 `megatron sft` smoke，可以确认当前 chunk CE 在 SFT 中没有把 user/tool/observation token 纳入 loss，也没有改变 assistant-only supervision 的语义。
 
 ## 4. Megatron 原生 fused CE 调查结论
 

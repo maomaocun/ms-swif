@@ -37,6 +37,10 @@
 - 🔥optimizer_cpu_offload: 将优化器状态卸载到 CPU，例如设置：`--use_precision_aware_optimizer true --optimizer_cpu_offload true --optimizer_offload_fraction 0.7`。默认为False。
   - 该参数可以显著降低显存占用（但增加内存占用）。若global_batch_size较大，则对训练速度的影响不大。
 - 🔥optimizer_offload_fraction: 卸载到 CPU 的优化器状态所占比例。默认为1.。
+- use_torch_optimizer_for_cpu_offload: 开启 CPU offload 时，使用 torch optimizer 作为 CPU 侧优化器。默认为False。
+- overlap_cpu_optimizer_d2h_h2d: 开启 CPU offload 时，将 CPU optimizer 更新与 D2H/H2D 数据传输重叠，用于降低 offload 带来的等待时间。默认为False。
+- pin_cpu_grads: 开启 CPU offload 时，将 CPU 侧梯度固定到 pinned memory。默认为True。
+- pin_cpu_params: 开启 CPU offload 时，将 CPU 侧参数固定到 pinned memory。默认为True。
 - use_precision_aware_optimizer: 使用 TransformerEngine 中的精度感知优化器，该优化器允许将主参数和优化器状态设置为较低精度，例如 fp16 和 fp8。
 - main_grads_dtype: 启用 use_precision_aware_optimizer 时主梯度的 dtype。可选为'fp32', 'bf16'。默认为'fp32'。
 - main_params_dtype: 启用 use_precision_aware_optimizer 时主参数的 dtype。可选为'fp32', 'fp16'。默认为'fp32'。

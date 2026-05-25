@@ -39,6 +39,10 @@
 - 🔥optimizer_cpu_offload: Offloads optimizer states to the CPU. For example, set: `--use_precision_aware_optimizer true --optimizer_cpu_offload true --optimizer_offload_fraction 0.7`. Defaults to `False`.
   - This parameter can significantly reduce GPU memory usage (at the cost of increased CPU memory consumption). When the `global_batch_size` is large, its impact on training speed is minimal.
 - 🔥optimizer_offload_fraction: The fraction of the optimizer state to offload to CPU. Default is `1.0`.
+- use_torch_optimizer_for_cpu_offload: Use a torch optimizer as the CPU-side optimizer when CPU offload is enabled. Default is False.
+- overlap_cpu_optimizer_d2h_h2d: Overlap CPU optimizer updates with D2H/H2D transfers when CPU offload is enabled, reducing wait time introduced by offload. Default is False.
+- pin_cpu_grads: Pin CPU-side gradients in pinned memory when CPU offload is enabled. Default is True.
+- pin_cpu_params: Pin CPU-side parameters in pinned memory when CPU offload is enabled. Default is True.
 - use_precision_aware_optimizer: Use the precision-aware optimizer in TransformerEngine, which allows setting the main parameters and optimizer states to lower precision, such as fp16 and fp8.
 - main_grads_dtype: The dtype of main gradients when use_precision_aware_optimizer is enabled. Options are 'fp32' and 'bf16'. Default is 'fp32'.
 - main_params_dtype: The dtype of main parameters when use_precision_aware_optimizer is enabled. Options are 'fp32' and 'fp16'. Default is 'fp32'.
