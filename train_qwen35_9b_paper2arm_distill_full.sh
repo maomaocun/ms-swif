@@ -7,24 +7,24 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/cpfs/public_data/public_model/Qwen3.5/Qwen3.5-9B}"
-DATASET_PATH="${DATASET_PATH:-/mnt/cpfs/yangyicun/data/datasets/openthoughts_prepared/openthoughts_sft_400k_filtered.jsonl}"
+DATASET_PATH="${DATASET_PATH:-${SCRIPT_DIR}/data/paper2arm_qwen37_max_sft_reward_ge_0.6.jsonl}"
 
-OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/qwen35-9b-openthoughts-sft}"
-LOG_ROOT="${LOG_ROOT:-${SCRIPT_DIR}/logs/qwen35-9b-openthoughts-sft}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/qwen35-9b-paper2arm-distill-sft}"
+LOG_ROOT="${LOG_ROOT:-${SCRIPT_DIR}/logs/qwen35-9b-paper2arm-distill-sft}"
 SMOKE="${SMOKE:-0}"
 if [[ -z "${RUN_NAME:-}" ]]; then
   if [[ "${SMOKE}" == "1" ]]; then
-    RUN_NAME="qwen35-9b-openthoughts-smoke-$(date +%Y%m%d-%H%M%S)"
+    RUN_NAME="qwen35-9b-paper2arm-distill-smoke-$(date +%Y%m%d-%H%M%S)"
   else
-    RUN_NAME="qwen35-9b-openthoughts-$(date +%Y%m%d-%H%M%S)"
+    RUN_NAME="qwen35-9b-paper2arm-distill-$(date +%Y%m%d-%H%M%S)"
   fi
 fi
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${RUN_NAME}}"
 LOG_DIR="${LOG_DIR:-${LOG_ROOT}/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${LOG_DIR}/train.log}"
 
-CACHE_ROOT="${CACHE_ROOT:-${SCRIPT_DIR}/cache/ms-swift-openthoughts}"
-LOCAL_CACHE_ROOT="${LOCAL_CACHE_ROOT:-${SCRIPT_DIR}/local_cache/ms-swift-openthoughts-${USER:-root}}"
+CACHE_ROOT="${CACHE_ROOT:-${SCRIPT_DIR}/cache/ms-swift-paper2arm-distill}"
+LOCAL_CACHE_ROOT="${LOCAL_CACHE_ROOT:-${SCRIPT_DIR}/local_cache/ms-swift-paper2arm-distill-${USER:-root}}"
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
@@ -34,44 +34,46 @@ DEEPSPEED="${DEEPSPEED:-zero2}"
 LOSS_SCALE="${LOSS_SCALE:-default}"
 if [[ "${SMOKE}" == "1" ]]; then
   MAX_LENGTH="${MAX_LENGTH:-4096}"
+  TRUNCATION_STRATEGY="${TRUNCATION_STRATEGY:-right}"
   SEQUENCE_PARALLEL_SIZE="${SEQUENCE_PARALLEL_SIZE:-1}"
   PADDING_FREE="${PADDING_FREE:-false}"
   USE_LOGITS_TO_KEEP="${USE_LOGITS_TO_KEEP:-true}"
 else
-  # The OpenThoughts filtered data is mostly ~16k-18k tokens; 4k truncates almost all samples.
-  # Benchmarks on 8 GPUs showed SP=1 + logits_to_keep is faster than SP=2/4 here.
-  MAX_LENGTH="${MAX_LENGTH:-18432}"
-  SEQUENCE_PARALLEL_SIZE="${SEQUENCE_PARALLEL_SIZE:-1}"
+  # Qwen3.5-9B tokenizer_config.model_max_length is 262144. The measured reward>=0.6
+  # trajectories top out at 169996 tokens, so this default keeps every trajectory intact.
+  MAX_LENGTH="${MAX_LENGTH:-262144}"
+  TRUNCATION_STRATEGY="${TRUNCATION_STRATEGY:-delete}"
+  # Qwen3.5 linear attention does not support derived ring attention, so SP=8 fails
+  # with rp_world_size=2. SP=4 keeps rp_world_size=1 and is the largest supported
+  # sequence-parallel setting on 8 GPUs for this model path.
+  SEQUENCE_PARALLEL_SIZE="${SEQUENCE_PARALLEL_SIZE:-4}"
   PADDING_FREE="${PADDING_FREE:-true}"
-  USE_LOGITS_TO_KEEP="${USE_LOGITS_TO_KEEP:-true}"
+  USE_LOGITS_TO_KEEP="${USE_LOGITS_TO_KEEP:-false}"
 fi
-if [[ "${SMOKE}" == "1" ]]; then
-  PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
-else
-  PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-2}"
-fi
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 PER_DEVICE_EVAL_BATCH_SIZE="${PER_DEVICE_EVAL_BATCH_SIZE:-1}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
-LEARNING_RATE="${LEARNING_RATE:-1e-5}"
-NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-8}"
+LEARNING_RATE="${LEARNING_RATE:-5e-6}"
+NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-3}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.05}"
 
 ATTN_IMPL="${ATTN_IMPL:-flash_attention_2}"
 USE_LIGER_KERNEL="${USE_LIGER_KERNEL:-true}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-true}"
 
-# Fast startup path: avoid full upfront tokenization and length sorting unless explicitly enabled.
-LAZY_TOKENIZE="${LAZY_TOKENIZE:-true}"
 if [[ "${SMOKE}" == "1" ]]; then
-  STREAMING="${STREAMING:-true}"
+  LAZY_TOKENIZE="${LAZY_TOKENIZE:-true}"
 else
-  STREAMING="${STREAMING:-false}"
+  # Only 48 default trajectories; eager tokenization avoids repeated long-sample encoding
+  # and lets truncation_strategy=delete filter overlength samples before training.
+  LAZY_TOKENIZE="${LAZY_TOKENIZE:-false}"
 fi
+STREAMING="${STREAMING:-false}"
 GROUP_BY_LENGTH="${GROUP_BY_LENGTH:-false}"
 PACKING="${PACKING:-false}"
 PACKING_NUM_PROC="${PACKING_NUM_PROC:-1}"
-DATASET_NUM_PROC="${DATASET_NUM_PROC:-16}"
-DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
+DATASET_NUM_PROC="${DATASET_NUM_PROC:-8}"
+DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 DATALOADER_PREFETCH_FACTOR="${DATALOADER_PREFETCH_FACTOR:-2}"
 LOAD_FROM_CACHE_FILE="${LOAD_FROM_CACHE_FILE:-true}"
 if [[ "${STREAMING}" == "true" && "${LAZY_TOKENIZE}" == "true" ]]; then
@@ -85,10 +87,10 @@ if [[ "${SMOKE}" == "1" ]]; then
 else
   SAVE_STRATEGY="${SAVE_STRATEGY:-steps}"
 fi
-SAVE_STEPS="${SAVE_STEPS:-500}"
-SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-2}"
+SAVE_STEPS="${SAVE_STEPS:-50}"
+SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
 SAVE_ONLY_MODEL="${SAVE_ONLY_MODEL:-true}"
-LOGGING_STEPS="${LOGGING_STEPS:-10}"
+LOGGING_STEPS="${LOGGING_STEPS:-1}"
 REPORT_TO="${REPORT_TO:-none}"
 DDP_TIMEOUT="${DDP_TIMEOUT:-3600000}"
 DISABLE_TQDM="${DISABLE_TQDM:-true}"
@@ -102,6 +104,22 @@ if [[ "${SMOKE}" == "1" ]]; then
   EVAL_STRATEGY=no
   SPLIT_DATASET_RATIO=0
   LOGGING_STEPS=1
+fi
+
+if [[ "${SEQUENCE_PARALLEL_SIZE}" != "1" && "${USE_LOGITS_TO_KEEP}" == "true" ]]; then
+  echo "ERROR: ms-swift prepare_logits_to_keep does not support sequence_parallel_size > 1." >&2
+  echo "       Use SEQUENCE_PARALLEL_SIZE=1 with USE_LOGITS_TO_KEEP=true, or keep SP enabled with CELOSS_PARALLEL_SIZE>0." >&2
+  exit 1
+fi
+if (( SEQUENCE_PARALLEL_SIZE > 4 )); then
+  echo "ERROR: Qwen3.5-9B HF sequence parallel is limited to 4 on this path." >&2
+  echo "       The model has num_key_value_heads=4; larger values derive ring parallel, which the Qwen3.5 linear-attention patch does not support." >&2
+  echo "       Use SEQUENCE_PARALLEL_SIZE=4 here, or switch to Megatron-SWIFT context_parallel_size for a separate CP setup." >&2
+  exit 1
+fi
+if [[ "${SEQUENCE_PARALLEL_SIZE}" != "1" && "${CELOSS_PARALLEL_SIZE}" == "0" ]]; then
+  echo "ERROR: sequence-parallel long-context training requires CELOSS_PARALLEL_SIZE>0 to chunk CE loss." >&2
+  exit 1
 fi
 
 if [[ ! -x "${SCRIPT_DIR}/.venv/bin/swift" ]]; then
@@ -145,6 +163,7 @@ cmd=(
   --dataset "${DATASET_PATH}"
   --torch_dtype bfloat16
   --max_length "${MAX_LENGTH}"
+  --truncation_strategy "${TRUNCATION_STRATEGY}"
   --loss_scale "${LOSS_SCALE}"
   --num_train_epochs "${NUM_TRAIN_EPOCHS}"
   --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE}"
@@ -192,6 +211,13 @@ fi
   echo "Log file: ${LOG_FILE}"
   echo "Model: ${MODEL_PATH}"
   echo "Dataset: ${DATASET_PATH}"
+  echo "Loss scale: ${LOSS_SCALE}"
+  echo "Truncation strategy: ${TRUNCATION_STRATEGY}"
+  echo "Sequence parallel size: ${SEQUENCE_PARALLEL_SIZE}"
+  echo "Padding free: ${PADDING_FREE}"
+  echo "Use logits to keep: ${USE_LOGITS_TO_KEEP}"
+  echo "CE loss parallel size: ${CELOSS_PARALLEL_SIZE}"
+  echo "Use Liger kernel: ${USE_LIGER_KERNEL}"
   echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
   echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
   echo "Cache root: ${CACHE_ROOT}"

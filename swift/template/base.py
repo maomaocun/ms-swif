@@ -2013,6 +2013,78 @@ class Template(ProcessorMixin):
         return res
 
     def print_inputs(self, inputs: Dict[str, Any]) -> None:
+        def _get_print_limit(name: str, default: int) -> int:
+            try:
+                return int(os.getenv(name, str(default)))
+            except ValueError:
+                return default
+
+        max_tokens = _get_print_limit('SWIFT_PRINT_INPUTS_MAX_TOKENS', 128)
+        max_chars = _get_print_limit('SWIFT_PRINT_INPUTS_MAX_CHARS', 4096)
+
+        def _to_list(val):
+            if isinstance(val, torch.Tensor):
+                return val.tolist()
+            if isinstance(val, tuple):
+                return list(val)
+            return val
+
+        def _truncate_text(text: str) -> str:
+            if max_chars <= 0 or len(text) <= max_chars:
+                return text
+            keep_head = max_chars // 2
+            keep_tail = max_chars - keep_head
+            return f'{text[:keep_head]}\n...[OMITTED {len(text) - max_chars} CHARS]...\n{text[-keep_tail:]}'
+
+        def _summarize_ids(ids, key: str):
+            ids = _to_list(ids)
+            if not isinstance(ids, list):
+                return ids
+            if ids and isinstance(ids[0], (list, tuple, torch.Tensor)):
+                return [_summarize_ids(sub_ids, key) for sub_ids in ids]
+            if max_tokens <= 0 or len(ids) <= max_tokens:
+                return ids
+
+            head_len = max_tokens // 2
+            tail_len = max_tokens - head_len
+            head = ids[:head_len]
+            tail = ids[-tail_len:] if tail_len > 0 else []
+            meta = f'len={len(ids)}, omitted={len(ids) - len(head) - len(tail)}'
+            if key.endswith('labels'):
+                ignore_count = sum(1 for token in ids if token == -100)
+                supervised_count = len(ids) - ignore_count
+                first_supervised = next((idx for idx, token in enumerate(ids) if token != -100), None)
+                meta += (
+                    f', ignore(-100)={ignore_count}, supervised={supervised_count}, '
+                    f'first_supervised_index={first_supervised}'
+                )
+            return {'summary': meta, 'head': head, 'tail': tail}
+
+        def _summarize_decoded(ids, key: str, **kwargs):
+            ids = _to_list(ids)
+            if not isinstance(ids, list):
+                return _truncate_text(str(ids))
+            if ids and isinstance(ids[0], (list, tuple, torch.Tensor)):
+                return [_summarize_decoded(sub_ids, key, **kwargs) for sub_ids in ids]
+            if max_tokens <= 0 or len(ids) <= max_tokens:
+                return _truncate_text(self.safe_decode(ids, **kwargs))
+
+            head_len = max_tokens // 2
+            tail_len = max_tokens - head_len
+            head_text = self.safe_decode(ids[:head_len], **kwargs)
+            tail_text = self.safe_decode(ids[-tail_len:], **kwargs) if tail_len > 0 else ''
+            omitted = len(ids) - head_len - tail_len
+            text = f'{head_text}\n...[OMITTED {omitted} TOKENS]...\n{tail_text}'
+            if key.endswith('labels'):
+                first_supervised = next((idx for idx, token in enumerate(ids) if token != -100), None)
+                if first_supervised is not None and first_supervised >= head_len:
+                    window = ids[first_supervised:first_supervised + max_tokens]
+                    text += (
+                        f'\n...[FIRST SUPERVISED TOKEN WINDOW @ {first_supervised}]...\n'
+                        f'{self.safe_decode(window, **kwargs)}'
+                    )
+            return _truncate_text(text)
+
         # Base keys to check
         tokenizer_kwargs = inputs.pop('tokenizer_kwargs', None) or {}
         base_keys = [
@@ -2060,19 +2132,15 @@ class Template(ProcessorMixin):
                 val = inputs.get(f'{key}_ids')
             if val is not None:
                 key_upper = key.upper()
-                logger.info(f'[{key_upper}_IDS] {val}')
+                logger.info(f'[{key_upper}_IDS] {_summarize_ids(val, key)}')
                 if key.endswith('labels') and self.task_type in {'seq_cls', 'embedding'}:
                     continue
                 if isinstance(val, (list, tuple, torch.Tensor)):
-                    # Handle nested lists (e.g., for reranker negative samples)
-                    if isinstance(val, (list, tuple)) and len(val) > 0 and isinstance(val[0], (list, tuple)):
-                        val_str = [self.safe_decode(sub_val, **tokenizer_kwargs) for sub_val in val]
-                    else:
-                        val_str = self.safe_decode(val, **tokenizer_kwargs)
+                    val_str = _summarize_decoded(val, key, **tokenizer_kwargs)
                     logger.info(f'[{key_upper}] {val_str}')
         if inputs.get('loss_scale') is not None:
             val = inputs['loss_scale']
-            logger.info(f'[LOSS_SCALE] {val}')
+            logger.info(f'[LOSS_SCALE] {_summarize_ids(val, "loss_scale")}')
 
     async def prepare_lmdeploy_pytorch_inputs(self, inputs) -> None:
         images = inputs.pop('images', None) or []
