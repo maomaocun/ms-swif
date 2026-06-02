@@ -1,0 +1,23 @@
+{
+  "dlc": {
+    "submit": true,
+    "job_name": "sft_qwen36_27b_dsv4pro_distill",
+    "binary": "/usr/local/bin/dlc",
+    "run_script": "/mnt/cpfs/yangyicun/innovator-agent/training/sft/ms-swift/dlc/worker_wrapper_qwen36_27b_dsv4pro_distill.sh",
+    "workers": 4,
+    "worker_gpu": 8,
+    "worker_cpu": 116,
+    "worker_memory": "1800Gi",
+    "worker_shared_memory": "1800Gi",
+    "priority": 1,
+    "running_timeout": 172800,
+    "worker_image": "dsw-registry-vpc.cn-wulanchabu.cr.aliyuncs.com/pai/python:3.13.9-gpu-cu129-ubuntu22.04-9e1c8c7e-1764331625",
+    "data_source_uris": "cpfs://cpfs-298fffb575a502fe.cn-wulanchabu/ptc-29f47d9393ad2b16/exp-29f2869e7d984aa6/::/mnt/cpfs,oss://pai-wlcb-ai-oss.oss-cn-wulanchabu-internal.aliyuncs.com/::/mnt/oss",
+    "resource_id": "quotaev2tl4w6aw0",
+    "workspace_id": "240810",
+    "vpc_id": "vpc-0jl5rpw5qokp6p2ettip6",
+    "switch_id": "vsw-0jlmr9rjzed093yr9c0kz",
+    "security_group_id": "sg-0jl0pd5qaerdj75wmred",
+    "extended_cidrs": "10.1.255.0/29,10.1.255.8/29,10.1.16.0/20"
+  }
+}

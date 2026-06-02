@@ -31,6 +31,10 @@ LOCAL_CACHE_ROOT="${LOCAL_CACHE_ROOT:-${SCRIPT_DIR}/local_cache/megatron-qwen36-
 
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+NNODES="${NNODES:-1}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:-127.0.0.1}"
+MASTER_PORT="${MASTER_PORT:-29500}"
 
 TUNER_TYPE="${TUNER_TYPE:-full}"
 LOSS_SCALE="${LOSS_SCALE:-default}"
@@ -122,6 +126,8 @@ SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
 LOGGING_STEPS="${LOGGING_STEPS:-1}"
 DDP_TIMEOUT="${DDP_TIMEOUT:-3600000}"
 REPORT_TO="${REPORT_TO:-tensorboard}"
+WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-${WANDB_PROJECT:-train_distillation}}"
+WANDB_EXP_NAME="${WANDB_EXP_NAME:-${WANDB_NAME:-${RUN_NAME}}}"
 
 TOTAL_MODEL_PARALLEL=$((TENSOR_MODEL_PARALLEL_SIZE * PIPELINE_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))
 if (( CONTEXT_PARALLEL_SIZE != 1 )); then
@@ -129,12 +135,13 @@ if (( CONTEXT_PARALLEL_SIZE != 1 )); then
   echo "       Current supported fallback is CP=1 with tensor/sequence parallelism; use the HF zero3_offload script if this OOMs." >&2
   exit 1
 fi
-if (( TOTAL_MODEL_PARALLEL > NPROC_PER_NODE || NPROC_PER_NODE % TOTAL_MODEL_PARALLEL != 0 )); then
-  echo "ERROR: TP*PP*CP must divide NPROC_PER_NODE." >&2
-  echo "       TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} NPROC=${NPROC_PER_NODE}" >&2
+WORLD_SIZE_TOTAL=$((NPROC_PER_NODE * NNODES))
+if (( TOTAL_MODEL_PARALLEL > WORLD_SIZE_TOTAL || WORLD_SIZE_TOTAL % TOTAL_MODEL_PARALLEL != 0 )); then
+  echo "ERROR: TP*PP*CP must divide total world size." >&2
+  echo "       TP=${TENSOR_MODEL_PARALLEL_SIZE} PP=${PIPELINE_MODEL_PARALLEL_SIZE} CP=${CONTEXT_PARALLEL_SIZE} NNODES=${NNODES} NPROC=${NPROC_PER_NODE} WORLD=${WORLD_SIZE_TOTAL}" >&2
   exit 1
 fi
-DATA_PARALLEL_SIZE=$((NPROC_PER_NODE / TOTAL_MODEL_PARALLEL))
+DATA_PARALLEL_SIZE=$((WORLD_SIZE_TOTAL / TOTAL_MODEL_PARALLEL))
 if (( GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * DATA_PARALLEL_SIZE) != 0 )); then
   echo "ERROR: GLOBAL_BATCH_SIZE must be divisible by MICRO_BATCH_SIZE*DATA_PARALLEL_SIZE." >&2
   echo "       GLOBAL=${GLOBAL_BATCH_SIZE} MICRO=${MICRO_BATCH_SIZE} DP=${DATA_PARALLEL_SIZE}" >&2
@@ -154,11 +161,18 @@ if [[ ! -f "${DATASET_PATH}" ]]; then
   echo "ERROR: DATASET_PATH does not exist: ${DATASET_PATH}" >&2
   exit 1
 fi
+if [[ "${SKIP_REASONING_DUP_CHECK:-0}" != "1" ]]; then
+  python3 "${SCRIPT_DIR}/scripts/check_reasoning_content_duplicates.py" "${DATASET_PATH}" --max-report 20
+fi
 
 mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}" "${CACHE_ROOT}" "${LOCAL_CACHE_ROOT}"
 
 export CUDA_VISIBLE_DEVICES
 export NPROC_PER_NODE
+export NNODES
+export NODE_RANK
+export MASTER_ADDR
+export MASTER_PORT
 export HF_HOME="${HF_HOME:-${CACHE_ROOT}/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${CACHE_ROOT}/datasets}"
 export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-${CACHE_ROOT}/modelscope}"
@@ -231,6 +245,8 @@ cmd=(
   --group_by_length "${GROUP_BY_LENGTH}"
   --attention_backend "${ATTENTION_BACKEND}"
   --report_to "${REPORT_TO}"
+  --wandb_project "${WANDB_PROJECT_NAME}"
+  --wandb_exp_name "${WANDB_EXP_NAME}"
   --ddp_timeout "${DDP_TIMEOUT}"
 )
 
@@ -276,8 +292,13 @@ fi
   echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER}"
   echo "Gradient accumulation fusion: ${GRADIENT_ACCUMULATION_FUSION}"
   echo "Async save: ${ASYNC_SAVE}"
+  echo "Report to: ${REPORT_TO}"
+  echo "W&B project/exp: ${WANDB_PROJECT_NAME}/${WANDB_EXP_NAME}"
   echo "LR/min_lr/warmup: ${LR}/${MIN_LR}/${LR_WARMUP_FRACTION}"
   echo "NPROC_PER_NODE: ${NPROC_PER_NODE}"
+  echo "NNODES/NODE_RANK: ${NNODES}/${NODE_RANK}"
+  echo "MASTER_ADDR/MASTER_PORT: ${MASTER_ADDR}/${MASTER_PORT}"
+  echo "Total world size: ${WORLD_SIZE_TOTAL}"
   echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
   echo "Cache root: ${CACHE_ROOT}"
   echo "Local cache root: ${LOCAL_CACHE_ROOT}"

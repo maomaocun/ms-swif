@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 from collections import Counter
 from pathlib import Path
@@ -34,6 +35,50 @@ BASH_TOOL = {
     },
 }
 
+TOOL_FAILURE_RE = re.compile(
+    r"(traceback|exception|error|failed|no such file|not found|timeout|timed out|"
+    r"module not found|command failed|permission denied|syntaxerror|typeerror|"
+    r"valueerror|nameerror|assertionerror)",
+    re.IGNORECASE,
+)
+PROVIDER_FAILURE_RE = re.compile(
+    r"(RateLimitError|rate.?limit|quota|token-limit|too many requests|\b429\b)",
+    re.IGNORECASE,
+)
+
+
+def candidate_metadata_dirs(input_dir: Path) -> list[Path]:
+    dirs = [
+        input_dir,
+        input_dir / "metadata",
+    ]
+    if input_dir.name == "tasks":
+        dirs.extend([input_dir.parent, input_dir.parent / "metadata"])
+
+    existing: list[Path] = []
+    seen: set[Path] = set()
+    for path in dirs:
+        resolved = path.resolve()
+        if path.exists() and resolved not in seen:
+            existing.append(path)
+            seen.add(resolved)
+    return existing
+
+
+def resolve_trial_dir(input_dir: Path) -> Path:
+    direct_trials = [
+        p
+        for p in input_dir.iterdir()
+        if p.is_dir() and (p / "agent" / "mini-swe-agent.trajectory.json").exists()
+    ]
+    if direct_trials:
+        return input_dir
+
+    tasks_dir = input_dir / "tasks"
+    if tasks_dir.exists():
+        return tasks_dir
+    return input_dir
+
 
 def load_reward_rows(run_dir: Path) -> list[dict[str, Any]]:
     candidate_names = [
@@ -43,16 +88,17 @@ def load_reward_rows(run_dir: Path) -> list[dict[str, Any]]:
     ]
     paths: list[Path] = []
     seen: set[Path] = set()
-    for name in candidate_names:
-        path = run_dir / name
-        if path.exists() and path not in seen:
-            paths.append(path)
-            seen.add(path)
-    for pattern in ("verify_results*.json", "verify_result*.json"):
-        for path in sorted(run_dir.glob(pattern)):
+    for metadata_dir in candidate_metadata_dirs(run_dir):
+        for name in candidate_names:
+            path = metadata_dir / name
             if path.exists() and path not in seen:
                 paths.append(path)
                 seen.add(path)
+        for pattern in ("verify_results*.json", "verify_result*.json"):
+            for path in sorted(metadata_dir.glob(pattern)):
+                if path.exists() and path not in seen:
+                    paths.append(path)
+                    seen.add(path)
 
     rows: list[dict[str, Any]] = []
     for path in paths:
@@ -70,6 +116,31 @@ def load_reward_map(run_dir: Path) -> dict[str, dict[str, Any]]:
         if row.get("trial") and str(row["trial"]) not in reward_map:
             reward_map[str(row["trial"])] = row
     return reward_map
+
+
+def load_trial_result_info(trial_dir: Path) -> dict[str, Any] | None:
+    result_path = trial_dir / "result.json"
+    if not result_path.exists():
+        return None
+    try:
+        result = json.loads(result_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    rewards = (result.get("verifier_result") or {}).get("rewards") or {}
+    reward = rewards.get("reward")
+    score = result.get("score_0_100")
+    if score is None and isinstance(reward, (int, float)):
+        score = float(reward) * 100.0
+    info: dict[str, Any] = {
+        "reward": float(reward) if isinstance(reward, (int, float)) else None,
+        "score_0_100": float(score) if isinstance(score, (int, float)) else None,
+        "source": "result.json",
+    }
+    exception_info = result.get("exception_info")
+    if exception_info:
+        info["exception_type"] = exception_info.get("exception_type") if isinstance(exception_info, dict) else None
+    return info
 
 
 def parse_tool_call(tool_call: dict[str, Any]) -> dict[str, Any] | None:
@@ -94,9 +165,20 @@ def parse_tool_call(tool_call: dict[str, Any]) -> dict[str, Any] | None:
     return {"name": name, "arguments": args}
 
 
+def normalize_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
 def assistant_content(message: dict[str, Any]) -> str:
-    reasoning = str(message.get("reasoning_content") or "").strip()
-    content = str(message.get("content") or "").strip()
+    reasoning = normalize_text(message.get("reasoning_content"))
+    content = normalize_text(message.get("content"))
+    if not content and "message" in message:
+        content = normalize_text(message.get("message"))
+    if reasoning and content and reasoning == content:
+        # Harbor issue #26: some converted traces copy the same assistant text into
+        # both fields. Keep one copy only so SFT/KD data never becomes
+        # <think>same text</think>same text.
+        reasoning = ""
     if reasoning:
         if content:
             return f"<think>\n{reasoning}\n</think>\n\n{content}"
@@ -115,45 +197,94 @@ def normalize_tool_response(content: Any) -> str:
     return json.dumps(content, ensure_ascii=False)
 
 
-def convert_messages(src_messages: list[dict[str, Any]], *, mask_tool_calls: bool = False) -> list[dict[str, Any]]:
+def is_failed_tool_response(content: Any) -> bool:
+    if content is None:
+        return False
+    parsed: Any | None = None
+    if isinstance(content, str):
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = None
+    else:
+        parsed = content
+
+    if isinstance(parsed, dict):
+        return_code = parsed.get("returncode", parsed.get("return_code"))
+        if isinstance(return_code, int) and return_code != 0:
+            return True
+        if parsed.get("exception") or parsed.get("error"):
+            return True
+        text = json.dumps(parsed, ensure_ascii=False)
+    else:
+        text = normalize_tool_response(content)
+    return bool(TOOL_FAILURE_RE.search(text))
+
+
+def contains_provider_failure(trajectory_path: Path) -> bool:
+    try:
+        text = trajectory_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    return bool(PROVIDER_FAILURE_RE.search(text))
+
+
+def convert_messages(
+    src_messages: list[dict[str, Any]],
+    *,
+    mask_tool_calls: bool = False,
+    mask_failed_tool_calls: bool = False,
+) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
+    last_tool_call_index: int | None = None
     for src in src_messages:
         role = src.get("role")
         if role == "system":
             messages.append({"role": "system", "content": str(src.get("content") or "")})
+            last_tool_call_index = None
             continue
         if role == "user":
             content = str(src.get("content") or "")
             if not any(msg["role"] == "user" for msg in messages):
                 messages.append({"role": "user", "content": content})
+                last_tool_call_index = None
             else:
                 # Mid-trajectory user messages are environment feedback from mini-swe-agent,
                 # for example mandatory-tool-call errors. They are context, not a new task.
                 messages.append({"role": "tool_response", "content": content})
+                if mask_failed_tool_calls and last_tool_call_index is not None and is_failed_tool_response(content):
+                    messages[last_tool_call_index]["loss"] = False
             continue
         if role == "assistant":
             content = assistant_content(src)
             tool_calls = [tc for tc in (parse_tool_call(tc) for tc in src.get("tool_calls") or []) if tc]
             if content.strip() or tool_calls:
                 messages.append({"role": "assistant", "content": content})
+                last_tool_call_index = None
             for tool_call in tool_calls:
                 message = {"role": "tool_call", "content": json.dumps(tool_call, ensure_ascii=False)}
                 if mask_tool_calls:
                     message["loss"] = False
                 messages.append(message)
+                last_tool_call_index = len(messages) - 1
             continue
         if role in {"tool", "tool_response"}:
-            messages.append({"role": "tool_response", "content": normalize_tool_response(src.get("content"))})
+            content = src.get("content")
+            if mask_failed_tool_calls and last_tool_call_index is not None and is_failed_tool_response(content):
+                messages[last_tool_call_index]["loss"] = False
+            messages.append({"role": "tool_response", "content": normalize_tool_response(content)})
+            last_tool_call_index = None
             continue
         # mini-swe-agent writes a final exit message. It is runtime bookkeeping, not model behavior.
         if role == "exit":
+            last_tool_call_index = None
             continue
     return compact_messages(messages)
 
 
-def compact_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+def compact_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Remove empty bookkeeping and keep a valid ms-swift agent sequence."""
-    cleaned: list[dict[str, str]] = []
+    cleaned: list[dict[str, Any]] = []
     for msg in messages:
         role = msg["role"]
         content = msg.get("content", "")
@@ -162,7 +293,10 @@ def compact_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
         if role == "assistant" and content == "<think>\n\n</think>\n":
             # Keep the assistant turn only if followed by a tool_call; this is handled by not dropping here.
             pass
-        cleaned.append({"role": role, "content": content})
+        cleaned_msg = {"role": role, "content": content}
+        if msg.get("loss") is False:
+            cleaned_msg["loss"] = False
+        cleaned.append(cleaned_msg)
     return cleaned
 
 
@@ -184,12 +318,17 @@ def convert_trial(
     *,
     teacher: str = "qwen3.7-max",
     mask_tool_calls: bool = False,
+    mask_failed_tool_calls: bool = False,
 ) -> dict[str, Any] | None:
     trajectory_path = trial_dir / "agent" / "mini-swe-agent.trajectory.json"
     if not trajectory_path.exists():
         return None
     obj = json.loads(trajectory_path.read_text(encoding="utf-8"))
-    messages = convert_messages(obj.get("messages") or [], mask_tool_calls=mask_tool_calls)
+    messages = convert_messages(
+        obj.get("messages") or [],
+        mask_tool_calls=mask_tool_calls,
+        mask_failed_tool_calls=mask_failed_tool_calls,
+    )
     if len(messages) < 3:
         return None
     if not any(msg["role"] == "assistant" for msg in messages):
@@ -272,6 +411,8 @@ def write_stats(samples: list[dict[str, Any]], stats_file: Path, run_dir: Path, 
         tool_calls = 0
         for msg in sample["messages"]:
             role_counts[msg["role"]] += 1
+            if msg.get("loss") is False:
+                role_counts[f"{msg['role']}_loss_false"] += 1
             total_chars += len(msg.get("content", ""))
             if msg["role"] == "assistant":
                 asst_chars += len(msg.get("content", ""))
@@ -322,22 +463,50 @@ def main() -> None:
         action="store_true",
         help="Set loss=false on tool_call messages. ms-swift otherwise renders tool_call as assistant output and trains it.",
     )
+    parser.add_argument(
+        "--mask-failed-tool-calls",
+        action="store_true",
+        help="Set loss=false only on tool_call messages whose following tool_response is clearly failed.",
+    )
+    parser.add_argument(
+        "--drop-provider-failures",
+        action="store_true",
+        help="Drop trajectories whose JSON contains provider/rate-limit/quota failure text.",
+    )
     args = parser.parse_args()
 
-    reward_map = load_reward_map(args.input_dir)
-    trial_dirs = sorted(p for p in args.input_dir.iterdir() if p.is_dir())
+    input_dir = args.input_dir
+    trial_root = resolve_trial_dir(input_dir)
+    reward_map = load_reward_map(input_dir)
+    trial_dirs = sorted(p for p in trial_root.iterdir() if p.is_dir())
     samples: list[dict[str, Any]] = []
     skipped_low_reward = 0
+    skipped_unknown_reward = 0
     skipped_invalid = 0
+    skipped_provider_failure = 0
     issues: list[tuple[str, list[str]]] = []
 
     for trial_dir in trial_dirs:
-        reward_info = reward_map.get(trial_dir.name)
+        reward_info = reward_map.get(trial_dir.name) or load_trial_result_info(trial_dir)
         reward = reward_info.get("reward") if reward_info else None
-        if args.min_reward is not None and isinstance(reward, (int, float)) and float(reward) < args.min_reward:
-            skipped_low_reward += 1
+        if args.min_reward is not None:
+            if not isinstance(reward, (int, float)):
+                skipped_unknown_reward += 1
+                continue
+            if float(reward) < args.min_reward:
+                skipped_low_reward += 1
+                continue
+        trajectory_path = trial_dir / "agent" / "mini-swe-agent.trajectory.json"
+        if args.drop_provider_failures and trajectory_path.exists() and contains_provider_failure(trajectory_path):
+            skipped_provider_failure += 1
             continue
-        sample = convert_trial(trial_dir, reward_info, teacher=args.teacher, mask_tool_calls=args.mask_tool_calls)
+        sample = convert_trial(
+            trial_dir,
+            reward_info,
+            teacher=args.teacher,
+            mask_tool_calls=args.mask_tool_calls,
+            mask_failed_tool_calls=args.mask_failed_tool_calls,
+        )
         if sample is None:
             skipped_invalid += 1
             continue
@@ -352,12 +521,15 @@ def main() -> None:
 
     write_jsonl(samples, args.output_file)
     stats_file = args.stats_file or args.output_file.with_suffix(args.output_file.suffix + ".stats.json")
-    write_stats(samples, stats_file, args.input_dir, args.min_reward)
+    write_stats(samples, stats_file, input_dir, args.min_reward)
 
-    print(f"input_dir: {args.input_dir}")
+    print(f"input_dir: {input_dir}")
+    print(f"trial_root: {trial_root}")
     print(f"trials: {len(trial_dirs)}")
     print(f"samples: {len(samples)}")
     print(f"skipped_low_reward: {skipped_low_reward}")
+    print(f"skipped_unknown_reward: {skipped_unknown_reward}")
+    print(f"skipped_provider_failure: {skipped_provider_failure}")
     print(f"skipped_invalid: {skipped_invalid}")
     print(f"output_file: {args.output_file}")
     print(f"stats_file: {stats_file}")

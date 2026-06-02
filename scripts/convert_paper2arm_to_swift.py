@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 
+def normalize_text(value: Any) -> str:
+    return str(value or '').strip()
+
+
 def extract_thinking_and_action(message: str) -> tuple[str, str]:
     """
     Extract thinking and action/response from agent message.
@@ -98,9 +102,17 @@ def trajectory_to_messages(trajectory: Dict[str, Any]) -> Optional[List[Dict[str
             })
         
         elif source == 'agent':
-            msg = step.get('message', '')
-            thinking, action_or_response = extract_thinking_and_action(msg)
-            content = format_assistant_content(thinking, action_or_response)
+            msg = normalize_text(step.get('message'))
+            reasoning = normalize_text(step.get('reasoning_content'))
+            if reasoning and msg and reasoning == msg:
+                # Harbor issue #26: ATIF conversion may copy message into
+                # reasoning_content. Do not export the same assistant text twice.
+                reasoning = ''
+            if reasoning:
+                content = format_assistant_content(reasoning, msg)
+            else:
+                thinking, action_or_response = extract_thinking_and_action(msg)
+                content = format_assistant_content(thinking, action_or_response)
             
             messages.append({
                 'role': 'assistant',
@@ -150,6 +162,21 @@ def process_trial(trial_dir: Path) -> Optional[Dict[str, Any]]:
     return {'messages': messages}
 
 
+def resolve_trial_dir(input_dir: Path) -> Path:
+    """Support both raw run roots and raw/<dataset>/tasks layouts."""
+    direct_trials = [
+        p for p in input_dir.iterdir()
+        if p.is_dir() and (p / 'agent' / 'trajectory.json').exists()
+    ]
+    if direct_trials:
+        return input_dir
+
+    tasks_dir = input_dir / 'tasks'
+    if tasks_dir.exists():
+        return tasks_dir
+    return input_dir
+
+
 def main():
     parser = argparse.ArgumentParser(description='Convert paper2arm trajectory data to ms-swift format')
     parser.add_argument('--input-dir', required=True, help='Input directory containing trial subdirectories')
@@ -158,16 +185,18 @@ def main():
     args = parser.parse_args()
     
     input_dir = Path(args.input_dir)
+    trial_root = resolve_trial_dir(input_dir)
     output_file = Path(args.output_file)
     
     # Find all trial directories
     trial_dirs = []
-    for name in sorted(os.listdir(input_dir)):
-        trial_path = input_dir / name
+    for name in sorted(os.listdir(trial_root)):
+        trial_path = trial_root / name
         if trial_path.is_dir() and (trial_path / 'agent' / 'trajectory.json').exists():
             trial_dirs.append(trial_path)
     
     print(f"Found {len(trial_dirs)} trial directories")
+    print(f"Trial root: {trial_root}")
     
     # Process each trial
     samples = []
