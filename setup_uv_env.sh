@@ -384,7 +384,7 @@ PY
 
   if [[ "${RUN_DRY_RUN}" == "1" ]]; then
     if [[ -d "/mnt/cpfs/public_data/public_model/Qwen3.6/Qwen3.6-27B" \
-          && -f "${SCRIPT_DIR}/data/paper2arm_qwen37_max_sft_reward_ge_0.6.jsonl" ]]; then
+          && -f "${SCRIPT_DIR}/data/processed/paper2arm_qwen37_max/paper2arm_qwen37_max_sft_reward_ge_0.6.jsonl" ]]; then
       log "Running 27B Megatron smoke dry-run"
       DRY_RUN=1 \
         SMOKE=1 \

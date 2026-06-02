@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/cpfs/public_data/public_model/Qwen3.6/Qwen3.6-27B}"
-DATASET_PATH="${DATASET_PATH:-${SCRIPT_DIR}/data/paper2arm_qwen37_max_sft_reward_ge_0.6.jsonl}"
+DATASET_PATH="${DATASET_PATH:-${SCRIPT_DIR}/data/processed/paper2arm_qwen37_max/paper2arm_qwen37_max_sft_reward_ge_0.6.jsonl}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/qwen36-27b-paper2arm-distill-sft-sp4}"
 LOG_ROOT="${LOG_ROOT:-${SCRIPT_DIR}/logs/qwen36-27b-paper2arm-distill-sft-sp4}"

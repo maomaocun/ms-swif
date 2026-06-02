@@ -10,7 +10,7 @@ cd "${SCRIPT_DIR}"
 source "${SCRIPT_DIR}/megatron_env.sh"
 
 MODEL_PATH="${MODEL_PATH:-/mnt/cpfs/public_data/public_model/Qwen3.5/Qwen3.5-9B}"
-DATASET_PATH="${DATASET_PATH:-${SCRIPT_DIR}/data/paper2arm_qwen37_max_sft_reward_ge_0.6.jsonl}"
+DATASET_PATH="${DATASET_PATH:-${SCRIPT_DIR}/data/processed/paper2arm_qwen37_max/paper2arm_qwen37_max_sft_reward_ge_0.6.jsonl}"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-${SCRIPT_DIR}/outputs/qwen35-9b-paper2arm-distill-megatron}"
 LOG_ROOT="${LOG_ROOT:-${SCRIPT_DIR}/logs/qwen35-9b-paper2arm-distill-megatron}"

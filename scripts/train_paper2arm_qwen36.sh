@@ -13,7 +13,7 @@ set -e
 # ============================
 MODEL="Qwen/Qwen3.6-27B"
 TEMPLATE="qwen3_5"
-DATASET="data/paper2arm_train.jsonl"
+DATASET="data/processed/paper2arm_legacy/paper2arm_train.jsonl"
 OUTPUT_DIR="output/paper2arm-qwen36-27b"
 
 # Training hyperparameters

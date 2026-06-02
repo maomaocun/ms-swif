@@ -35,14 +35,39 @@ BASH_TOOL = {
 }
 
 
+def load_reward_rows(run_dir: Path) -> list[dict[str, Any]]:
+    candidate_names = [
+        "verift_result.json",
+        "verify_results_fixed_rubric_20260525.json",
+        "verify_result_rerun.json",
+    ]
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for name in candidate_names:
+        path = run_dir / name
+        if path.exists() and path not in seen:
+            paths.append(path)
+            seen.add(path)
+    for pattern in ("verify_results*.json", "verify_result*.json"):
+        for path in sorted(run_dir.glob(pattern)):
+            if path.exists() and path not in seen:
+                paths.append(path)
+                seen.add(path)
+
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(loaded, list):
+            continue
+        rows.extend(row for row in loaded if isinstance(row, dict))
+    return rows
+
+
 def load_reward_map(run_dir: Path) -> dict[str, dict[str, Any]]:
-    path = run_dir / "verift_result.json"
-    if not path.exists():
-        return {}
-    rows = json.loads(path.read_text(encoding="utf-8"))
+    rows = load_reward_rows(run_dir)
     reward_map: dict[str, dict[str, Any]] = {}
     for row in rows:
-        if isinstance(row, dict) and row.get("trial"):
+        if row.get("trial") and str(row["trial"]) not in reward_map:
             reward_map[str(row["trial"])] = row
     return reward_map
 
@@ -157,6 +182,7 @@ def convert_trial(
     trial_dir: Path,
     reward_info: dict[str, Any] | None,
     *,
+    teacher: str = "qwen3.7-max",
     mask_tool_calls: bool = False,
 ) -> dict[str, Any] | None:
     trajectory_path = trial_dir / "agent" / "mini-swe-agent.trajectory.json"
@@ -188,7 +214,7 @@ def convert_trial(
             "trial": trial_dir.name,
             "reward": reward,
             "score_0_100": score,
-            "teacher": "qwen3.7-max",
+            "teacher": teacher,
         },
     }
 
@@ -290,6 +316,7 @@ def main() -> None:
     parser.add_argument("--stats-file", type=Path)
     parser.add_argument("--min-reward", type=float, default=None)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--teacher", default="qwen3.7-max")
     parser.add_argument(
         "--mask-tool-calls",
         action="store_true",
@@ -310,7 +337,7 @@ def main() -> None:
         if args.min_reward is not None and isinstance(reward, (int, float)) and float(reward) < args.min_reward:
             skipped_low_reward += 1
             continue
-        sample = convert_trial(trial_dir, reward_info, mask_tool_calls=args.mask_tool_calls)
+        sample = convert_trial(trial_dir, reward_info, teacher=args.teacher, mask_tool_calls=args.mask_tool_calls)
         if sample is None:
             skipped_invalid += 1
             continue
