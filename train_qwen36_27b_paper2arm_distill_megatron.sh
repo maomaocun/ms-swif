@@ -138,6 +138,7 @@ if [[ -z "${RECOMPUTE_MODULES+x}" ]]; then
   fi
 fi
 CROSS_ENTROPY_LOSS_FUSION="${CROSS_ENTROPY_LOSS_FUSION:-true}"
+LINEAR_CE_IMPL="${LINEAR_CE_IMPL:-torch}"
 LINEAR_CE_CHUNK_SIZE="${LINEAR_CE_CHUNK_SIZE:-2048}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 TP_COMM_OVERLAP="${TP_COMM_OVERLAP:-false}"
@@ -310,6 +311,7 @@ export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${CACHE_ROOT}/datasets}"
 export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-${CACHE_ROOT}/modelscope}"
 export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${LOCAL_CACHE_ROOT}/triton}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${LOCAL_CACHE_ROOT}/torch_extensions}"
+export LINEAR_CE_IMPL
 export LINEAR_CE_CHUNK_SIZE
 export USE_MCORE_GDN
 export ALLOW_MCORE_GDN_CP="${ALLOW_MCORE_GDN_CP:-false}"
@@ -492,7 +494,7 @@ export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
   echo "Optimizer CPU offload: ${OPTIMIZER_CPU_OFFLOAD} fraction=${OPTIMIZER_OFFLOAD_FRACTION} torch_optimizer=${USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD} overlap_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} pin_grads=${PIN_CPU_GRADS} pin_params=${PIN_CPU_PARAMS}"
   echo "Precision-aware optimizer: ${USE_PRECISION_AWARE_OPTIMIZER} main_grads=${MAIN_GRADS_DTYPE} main_params=${MAIN_PARAMS_DTYPE} exp_avg=${EXP_AVG_DTYPE} exp_avg_sq=${EXP_AVG_SQ_DTYPE}"
   echo "Cross entropy loss fusion: ${CROSS_ENTROPY_LOSS_FUSION}"
-  echo "Chunked linear CE chunk size: ${LINEAR_CE_CHUNK_SIZE}"
+  echo "Chunked linear CE: impl=${LINEAR_CE_IMPL} chunk_size=${LINEAR_CE_CHUNK_SIZE}"
   echo "Recompute: granularity=${RECOMPUTE_GRANULARITY} method=${RECOMPUTE_METHOD} num_layers=${RECOMPUTE_NUM_LAYERS} modules=${RECOMPUTE_MODULES:-<default>}"
   echo "Overlap: tp_comm=${TP_COMM_OVERLAP} grad_reduce=${OVERLAP_GRAD_REDUCE} param_gather=${OVERLAP_PARAM_GATHER} param_gather_with_step=${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP}"
   echo "Data: data_sharding=${DATA_SHARDING} group_by_length=${GROUP_BY_LENGTH} packing=${PACKING} packing_length=${PACKING_LENGTH:-<auto>} padding_free=${PADDING_FREE} apply_rope_fusion=${APPLY_ROPE_FUSION} dataloader_pin_memory=${DATALOADER_PIN_MEMORY} persistent_workers=${DATALOADER_PERSISTENT_WORKERS}"
