@@ -36,6 +36,8 @@ APPLY_CHUNKED_CE_PATCH="${APPLY_CHUNKED_CE_PATCH:-1}"
 RUN_DRY_RUN="${RUN_DRY_RUN:-1}"
 
 MCORE_BRIDGE_VERSION="${MCORE_BRIDGE_VERSION:-1.4.0}"
+MCORE_BRIDGE_SOURCE_DIR="${MCORE_BRIDGE_SOURCE_DIR:-${SCRIPT_DIR}/.deps/mcore-bridge}"
+MCORE_BRIDGE_REF="${MCORE_BRIDGE_REF:-v${MCORE_BRIDGE_VERSION}}"
 MEGATRON_CORE_VERSION="${MEGATRON_CORE_VERSION:-0.17.0}"
 PEFT_VERSION="${PEFT_VERSION:-0.19.1}"
 DEEPSPEED_VERSION="${DEEPSPEED_VERSION:-0.19.0}"
@@ -111,15 +113,19 @@ install_megatron_env() {
   fi
 
   local py="${MEGATRON_VENV_DIR}/bin/python"
-  if python_has_distribution "${py}" mcore-bridge && python_has_distribution "${py}" megatron-core; then
+  if python_has_distribution "${py}" megatron-core; then
     log "Megatron dependencies already installed"
   else
     log "Installing Megatron dependencies into ${MEGATRON_VENV_DIR}"
     uv_pip "${py}" \
-      "mcore-bridge==${MCORE_BRIDGE_VERSION}" \
       "megatron-core==${MEGATRON_CORE_VERSION}" \
       "peft==${PEFT_VERSION}"
   fi
+  if [[ ! -d "${MCORE_BRIDGE_SOURCE_DIR}/.git" ]]; then
+    run git clone https://github.com/modelscope/mcore-bridge.git "${MCORE_BRIDGE_SOURCE_DIR}"
+  fi
+  run git -C "${MCORE_BRIDGE_SOURCE_DIR}" checkout "${MCORE_BRIDGE_REF}"
+  uv_pip "${py}" --no-deps -e "${MCORE_BRIDGE_SOURCE_DIR}"
 
   if [[ ! -x "${MEGATRON_VENV_DIR}/bin/megatron" || ! -x "${MEGATRON_VENV_DIR}/bin/swift" ]]; then
     uv_pip "${py}" --no-deps -e .
@@ -130,22 +136,22 @@ apply_chunked_ce_patch() {
   [[ "${APPLY_CHUNKED_CE_PATCH}" == "1" ]] || return
 
   local py="${MEGATRON_VENV_DIR}/bin/python"
-  log "Applying/verifying chunked linear CE patch"
-  # shellcheck source=/dev/null
-  source "${SCRIPT_DIR}/megatron_env.sh"
-  "${py}" - <<'PY'
+  log "Applying/verifying chunked linear CE patch in mcore-bridge source"
+  MCORE_BRIDGE_SOURCE_DIR="${MCORE_BRIDGE_SOURCE_DIR}" "${py}" - <<'PY'
 from __future__ import annotations
 
 from pathlib import Path
-import mcore_bridge
+import os
 import py_compile
 
-bridge_root = Path(mcore_bridge.__file__).resolve().parent
-target = bridge_root / "model" / "gpt_model.py"
+source_root = Path(os.environ["MCORE_BRIDGE_SOURCE_DIR"]).resolve()
+target = source_root / "src" / "mcore_bridge" / "model" / "gpt_model.py"
+if not target.exists():
+    raise RuntimeError(f"Cannot patch mcore-bridge source: {target} does not exist")
 text = target.read_text()
 
 if "_ChunkedLinearCrossEntropy" in text:
-    print(f"chunked linear CE patch already present: {target}")
+    print(f"chunked linear CE source patch already present: {target}")
     py_compile.compile(str(target), doraise=True)
     raise SystemExit(0)
 
@@ -209,31 +215,32 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         labels_t = labels.transpose(0, 1).contiguous()
         hidden_flat = hidden_states.contiguous().view(seq_len * batch_size, hidden_size)
         target_flat = labels_t.view(-1)
+        supervised_indices = torch.nonzero(target_flat != -100, as_tuple=False).flatten()
         partition_vocab_size = output_weight.shape[0]
         vocab_end_index = vocab_start_index + partition_vocab_size
-        losses_flat = torch.empty((seq_len * batch_size,), dtype=torch.float32, device=hidden_states.device)
+        losses_flat = torch.zeros((seq_len * batch_size,), dtype=torch.float32, device=hidden_states.device)
 
-        for chunk_start in range(0, hidden_flat.shape[0], chunk_size):
-            chunk_end = min(hidden_flat.shape[0], chunk_start + chunk_size)
-            target = target_flat[chunk_start:chunk_end]
-            logits = torch.matmul(hidden_flat[chunk_start:chunk_end], output_weight.t()).float()
+        for chunk_start in range(0, supervised_indices.numel(), chunk_size):
+            chunk_end = min(supervised_indices.numel(), chunk_start + chunk_size)
+            token_indices = supervised_indices[chunk_start:chunk_end]
+            target = target_flat.index_select(0, token_indices)
+            logits = torch.matmul(hidden_flat.index_select(0, token_indices), output_weight.t()).float()
 
             local_max = logits.max(dim=-1).values
             global_max = _tp_all_reduce(local_max, torch.distributed.ReduceOp.MAX, tp_group)
             exp_logits = torch.exp(logits - global_max.unsqueeze(-1))
             global_sum = _tp_all_reduce(exp_logits.sum(dim=-1), torch.distributed.ReduceOp.SUM, tp_group)
 
-            target_mask = (target == -100) | (target < vocab_start_index) | (target >= vocab_end_index)
+            target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
             local_target = (target - vocab_start_index).masked_fill(target_mask, 0)
             target_logits = torch.gather(logits, dim=-1, index=local_target.unsqueeze(-1)).squeeze(-1)
             target_logits = target_logits.masked_fill(target_mask, 0.0)
             target_logits = _tp_all_reduce(target_logits, torch.distributed.ReduceOp.SUM, tp_group)
 
             chunk_loss = torch.log(global_sum) + global_max - target_logits
-            chunk_loss = chunk_loss.masked_fill(target == -100, 0.0)
-            losses_flat[chunk_start:chunk_end] = chunk_loss
+            losses_flat.index_copy_(0, token_indices, chunk_loss)
 
-        ctx.save_for_backward(hidden_states, output_weight, labels_t)
+        ctx.save_for_backward(hidden_states, output_weight, target_flat, supervised_indices)
         ctx.tp_group = tp_group
         ctx.vocab_start_index = vocab_start_index
         ctx.chunk_size = chunk_size
@@ -242,7 +249,7 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        hidden_states, output_weight, labels_t = ctx.saved_tensors
+        hidden_states, output_weight, target_flat, supervised_indices = ctx.saved_tensors
         tp_group = ctx.tp_group
         vocab_start_index = ctx.vocab_start_index
         chunk_size = ctx.chunk_size
@@ -252,15 +259,15 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
         seq_len, batch_size, hidden_size = hidden_states.shape
 
         hidden_flat = hidden_states.contiguous().view(seq_len * batch_size, hidden_size)
-        target_flat = labels_t.view(-1)
         grad_output_flat = grad_output.transpose(0, 1).contiguous().view(-1).float()
         grad_hidden_flat = torch.zeros_like(hidden_flat) if ctx.needs_input_grad[0] else None
         grad_weight = torch.zeros_like(output_weight) if ctx.needs_input_grad[1] else None
 
-        for chunk_start in range(0, hidden_flat.shape[0], chunk_size):
-            chunk_end = min(hidden_flat.shape[0], chunk_start + chunk_size)
-            hidden_chunk = hidden_flat[chunk_start:chunk_end]
-            target = target_flat[chunk_start:chunk_end]
+        for chunk_start in range(0, supervised_indices.numel(), chunk_size):
+            chunk_end = min(supervised_indices.numel(), chunk_start + chunk_size)
+            token_indices = supervised_indices[chunk_start:chunk_end]
+            hidden_chunk = hidden_flat.index_select(0, token_indices)
+            target = target_flat.index_select(0, token_indices)
             logits = torch.matmul(hidden_chunk, output_weight.t()).float()
 
             local_max = logits.max(dim=-1).values
@@ -269,18 +276,17 @@ class _ChunkedLinearCrossEntropy(torch.autograd.Function):
             global_sum = _tp_all_reduce(exp_logits.sum(dim=-1), torch.distributed.ReduceOp.SUM, tp_group)
             grad_logits = exp_logits / global_sum.unsqueeze(-1)
 
-            target_mask = (target == -100) | (target < vocab_start_index) | (target >= vocab_end_index)
+            target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
             local_target = (target - vocab_start_index).masked_fill(target_mask, 0)
             subtract = (~target_mask).to(dtype=grad_logits.dtype).unsqueeze(-1)
             grad_logits.scatter_add_(dim=-1, index=local_target.unsqueeze(-1), src=-subtract)
-            grad_logits = grad_logits.masked_fill((target == -100).unsqueeze(-1), 0.0)
-            grad_logits.mul_(grad_output_flat[chunk_start:chunk_end].unsqueeze(-1))
+            grad_logits.mul_(grad_output_flat.index_select(0, token_indices).unsqueeze(-1))
 
             if grad_hidden_flat is not None:
                 grad_hidden_chunk = torch.matmul(grad_logits, output_weight.float())
                 if reduce_grad_input:
                     _tp_all_reduce(grad_hidden_chunk, torch.distributed.ReduceOp.SUM, tp_group)
-                grad_hidden_flat[chunk_start:chunk_end] = grad_hidden_chunk.to(dtype=hidden_states.dtype)
+                grad_hidden_flat.index_copy_(0, token_indices, grad_hidden_chunk.to(dtype=hidden_states.dtype))
 
             if grad_weight is not None:
                 grad_weight_chunk = torch.matmul(grad_logits.t(), hidden_chunk.float())
@@ -319,8 +325,9 @@ hook = r'''
                 raise ValueError('LINEAR_CE_CHUNK_SIZE requires vocab-parallel output; runtime_gather_output must be false.')
             if getattr(self.config, 'use_mup', False):
                 raise ValueError('LINEAR_CE_CHUNK_SIZE currently does not support MuP output scaling.')
-            if not getattr(self, '_linear_ce_chunk_size_logged', False):
-                logger.info(f'Using chunked linear CE loss with LINEAR_CE_CHUNK_SIZE={linear_ce_chunk_size}.')
+            if (os.environ.get('LINEAR_CE_DEBUG', '').lower() in {'1', 'true', 'yes', 'on'}
+                    and not getattr(self, '_linear_ce_chunk_size_logged', False)):
+                logger.info(f'Using supervised-token chunked linear CE loss; chunk_size={linear_ce_chunk_size}.')
                 self._linear_ce_chunk_size_logged = True
             return _chunked_linear_cross_entropy_loss(self, hidden_states, output_weight, labels, linear_ce_chunk_size)
 
@@ -344,6 +351,7 @@ target.write_text(text)
 py_compile.compile(str(target), doraise=True)
 print(f"patched chunked linear CE into: {target}")
 PY
+  uv_pip "${py}" --no-deps -e "${MCORE_BRIDGE_SOURCE_DIR}"
 }
 
 validate_env() {

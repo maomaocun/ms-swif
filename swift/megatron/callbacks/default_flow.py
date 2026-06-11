@@ -28,7 +28,8 @@ class DefaultFlowCallback(MegatronCallback):
         if state.iteration >= args.train_iters:
             if args.eval_iters > 0:
                 state.should_eval = True
-            state.should_save = True
+            if not args.skip_final_save:
+                state.should_save = True
         if args.manual_gc and args.manual_gc_steps != 0 and state.iteration % args.manual_gc_steps == 0:
             gc.collect()
 

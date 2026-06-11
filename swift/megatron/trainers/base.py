@@ -57,6 +57,34 @@ mcore_016 = version.parse(megatron.core.__version__) >= version.parse('0.16.0rc0
 logger = get_logger()
 
 
+def _format_model_config_summary(config) -> str:
+    fields = [
+        'num_layers',
+        'hidden_size',
+        'num_attention_heads',
+        'num_query_groups',
+        'ffn_hidden_size',
+        'padded_vocab_size',
+        'max_position_embeddings',
+        'attention_backend',
+        'experimental_attention_variant',
+        'tensor_model_parallel_size',
+        'pipeline_model_parallel_size',
+        'context_parallel_size',
+        'sequence_parallel',
+        'recompute_granularity',
+        'recompute_method',
+        'recompute_num_layers',
+        'cross_entropy_loss_fusion',
+        'transformer_impl',
+    ]
+    parts = []
+    for field in fields:
+        if hasattr(config, field):
+            parts.append(f'{field}={getattr(config, field)}')
+    return ', '.join(parts)
+
+
 class BaseMegatronTrainer(ABC):
 
     def __init__(self, args, template: Template):
@@ -67,22 +95,30 @@ class BaseMegatronTrainer(ABC):
 
         self.args = args
         self.template = template
+        logger.info('startup_marker: trainer_prepare_model_start')
         self.prepare_model()
+        logger.info('startup_marker: trainer_prepare_model_done')
         # Sync template.padding_free after prepare_model(), because _check_padding_free
         # may override args.padding_free for certain models (e.g. DSA attention).
         if template.padding_free != args.padding_free:
             logger.warning(f'template.padding_free({template.padding_free}) != args.padding_free({args.padding_free}), '
                            f'syncing template.padding_free to {args.padding_free}.')
             template.padding_free = args.padding_free
+        logger.info('startup_marker: trainer_optimizer_start')
         self.optimizer, self.opt_param_scheduler = self.get_optimizer_and_scheduler()
+        logger.info('startup_marker: trainer_optimizer_done')
+        logger.info('startup_marker: trainer_data_collator_start')
         self.data_collator = self._get_data_collator()
+        logger.info('startup_marker: trainer_data_collator_done')
 
         self.state = TrainerState(max_steps=args.train_iters)
         initialize_embedding = args.new_special_tokens or args.task_type == 'seq_cls'
         if initialize_embedding:
             for m in self.unwrapped_models:
                 self._initialize_embedding(m)
+        logger.info('startup_marker: trainer_load_checkpoint_start')
         self._load_checkpoint()
+        logger.info('startup_marker: trainer_load_checkpoint_done')
 
         self.eval_metrics = None
         if args.check_model and hasattr(args, 'model_dir'):
@@ -101,9 +137,13 @@ class BaseMegatronTrainer(ABC):
             self.callbacks.append(megatron_callbacks_map[callback](self))
 
         if args.tp_comm_overlap:
+            logger.info('startup_marker: trainer_tp_comm_start')
             initialize_tp_communicators(args, self.config)
+            logger.info('startup_marker: trainer_tp_comm_done')
 
+        logger.info('startup_marker: trainer_warmup_jit_start')
         warmup_jit_function(self.config, args)
+        logger.info('startup_marker: trainer_warmup_jit_done')
 
         if args.async_save and args.use_persistent_ckpt_worker:
             init_persistent_async_worker()
@@ -113,11 +153,15 @@ class BaseMegatronTrainer(ABC):
         if not args.finetune:
             self.state.iteration = self._load_iteration()
         if args.mcore_model is not None:
+            logger.info('startup_marker: load_mcore_model_start')
             self.state.iteration = load_mcore_checkpoint(
                 args, self.wrapped_models, self.optimizer, self.opt_param_scheduler, load_arg='mcore_model')
+            logger.info('startup_marker: load_mcore_model_done')
         if args.mcore_adapter is not None:
+            logger.info('startup_marker: load_mcore_adapter_start')
             self.state.iteration = load_mcore_checkpoint(
                 args, self.wrapped_models, self.optimizer, self.opt_param_scheduler, load_arg='mcore_adapter')
+            logger.info('startup_marker: load_mcore_adapter_done')
         self.state.consumed_train_samples = getattr(args, 'consumed_train_samples', 0)
 
     def call_event(self, event, **kwargs):
@@ -183,21 +227,34 @@ class BaseMegatronTrainer(ABC):
 
     def prepare_model(self):
         args = self.args
+        logger.info('startup_marker: get_mcore_model_start')
         self.unwrapped_models = get_mcore_model(args, self.template.config)
+        logger.info('startup_marker: get_mcore_model_done')
         self.config = self.unwrapped_models[0].config
-        logger.info(f'model_config: {self.config}')
+        if os.environ.get('SWIFT_LOG_FULL_MODEL_CONFIG', '0') == '1':
+            logger.info(f'model_config: {self.config}')
+        else:
+            logger.info(f'model_config_summary: {_format_model_config_summary(self.config)}')
         self.bridge = self.config.bridge
+        logger.info('startup_marker: prepare_peft_model_start')
         self.peft_models = self._prepare_peft_model(self.unwrapped_models)
+        logger.info('startup_marker: prepare_peft_model_done')
+        logger.info('startup_marker: wrap_model_start')
         self.wrapped_models = wrap_model(args, self.unwrapped_models)
+        logger.info('startup_marker: wrap_model_done')
 
     def _prepare_peft_model(self, models):
         args = self.args
         if args.mcore_model is None:
+            logger.info('startup_marker: bridge_load_weights_start')
             self.bridge.load_weights(models, args.model_dir)
+            logger.info('startup_marker: bridge_load_weights_done')
         peft_models = [prepare_mcore_model(args, model) for model in models]
         if args.tuner_type == 'lora' and args.adapters and args.mcore_adapter is None:
             assert len(args.adapters) == 1, 'Currently only support one adapter.'
+            logger.info('startup_marker: bridge_load_adapter_start')
             self.bridge.load_weights(models, args.adapters[0], peft_format=True, adapter_name='default')
+            logger.info('startup_marker: bridge_load_adapter_done')
         return peft_models
 
     def get_optimizer_and_scheduler(self):

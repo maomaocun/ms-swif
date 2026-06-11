@@ -1,7 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 from swift.utils import check_json_format, is_last_rank
 from .base import MegatronCallback
-from .utils import rewrite_logs
+from .utils import get_tensorboard_dir, rewrite_logs
 
 
 class TensorboardCallback(MegatronCallback):
@@ -10,9 +10,7 @@ class TensorboardCallback(MegatronCallback):
         super().__init__(trainer)
         args = self.args
         self.config = check_json_format(vars(args))
-        self.save_dir = args.tensorboard_dir
-        if self.save_dir is None:
-            self.save_dir = f'{args.output_dir}/runs'
+        self.save_dir = get_tensorboard_dir(args)
         from torch.utils.tensorboard import SummaryWriter
         self.writer = None
         if is_last_rank():

@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import megatron.core
+import os
 import re
 import torch
 import torch.distributed as dist
@@ -186,7 +187,10 @@ def prepare_mcore_model(args, model):
         model = prepare_adapter(args, model)
         if args.tuner_type == 'lora_llm':
             _prepare_full_vit(args, model)
-    logger.info(f'model: {model}')
+    if os.environ.get('SWIFT_LOG_FULL_MODEL_STRUCTURE', '0') == '1':
+        logger.info(f'model: {model}')
+    else:
+        logger.info(f'model_class: {model.__class__.__name__}')
     logger.info_if(
         f'[rank{dist.get_rank()}] model_parameter_info: {get_model_parameter_info(model)}',
         cond=mpu.get_data_parallel_rank() == 0)

@@ -43,7 +43,7 @@ RUN_DRY_RUN=0 bash setup_uv_env.sh
 - 安装 HF/DeepSpeed 路径依赖
 - 安装 Megatron/mcore_bridge 路径依赖
 - 安装当前 ms-swift 源码为 editable package
-- 给 mcore_bridge 打 `LINEAR_CE_CHUNK_SIZE` 的 chunked linear CE patch
+- clone/复用 `.deps/mcore-bridge`，给源码打 `LINEAR_CE_CHUNK_SIZE` patch，并以 editable 方式安装
 - 校验 `torch`、`transformers`、`deepspeed`、`swift`、`mcore_bridge` 是否可导入
 - 校验 `megatron` / `swift` 命令是否可用
 - 默认执行一次 27B Megatron smoke dry-run，不真正启动训练
@@ -73,7 +73,7 @@ setup 里的 dry-run 输出会写到 `/tmp/ms-swift-setup-*`，不会污染当�
 `.venv-megatron` 用于 Megatron 路径，主要承载：
 
 - megatron-core
-- mcore-bridge
+- mcore-bridge editable install（源码在 `.deps/mcore-bridge`）
 - Megatron 入口命令 `megatron`
 - ms-swift editable package
 
@@ -194,10 +194,16 @@ LINEAR_CE_CHUNK_SIZE=2048
 
 ## 6. Chunked Linear CE Patch
 
-当前环境包含一个运行时 patch：
+当前环境使用源码 patch，而不是直接修改 `.venv-megatron/site-packages`：
 
 ```text
-.venv-megatron/lib/python3.12/site-packages/mcore_bridge/model/gpt_model.py
+.deps/mcore-bridge/src/mcore_bridge/model/gpt_model.py
+```
+
+`.venv-megatron` 中的 `mcore_bridge` 是 editable install：
+
+```text
+.venv-megatron/lib/python3.12/site-packages/__editable__.mcore_bridge-1.4.0.pth
 ```
 
 该 patch 增加：
@@ -212,7 +218,7 @@ LINEAR_CE_CHUNK_SIZE
 LINEAR_CE_CHUNK_SIZE=2048
 ```
 
-作用：在 Megatron SFT 中绕过完整 `[tokens, vocab/TP]` logits 常驻，按扁平 token chunk 计算 linear CE，直接返回 per-token loss。
+作用：在 Megatron SFT 中绕过完整 `[tokens, vocab/TP]` logits 常驻，只对 `labels != -100` 的 supervised token 按扁平 token chunk 计算 linear CE，直接返回 per-token loss。
 
 开启：
 
@@ -226,13 +232,19 @@ LINEAR_CE_CHUNK_SIZE=2048 bash train_qwen36_27b_paper2arm_distill_megatron.sh
 LINEAR_CE_CHUNK_SIZE=0 bash train_qwen36_27b_paper2arm_distill_megatron.sh
 ```
 
-命中 patch 时日志应出现：
+默认生产训练不会打印 CE 分支命中日志。需要排查时显式开启：
 
-```text
-[INFO:mcore_bridge] Using chunked linear CE loss with LINEAR_CE_CHUNK_SIZE=2048.
+```bash
+LINEAR_CE_DEBUG=1 LINEAR_CE_CHUNK_SIZE=2048 bash train_qwen36_27b_paper2arm_distill_megatron.sh
 ```
 
-如果重建 `.venv-megatron`，需要重新应用 patch。`setup_uv_env.sh` 默认会自动应用并校验。
+此时只会打印一次简短日志：
+
+```text
+[INFO:mcore_bridge] Using supervised-token chunked linear CE loss; chunk_size=2048.
+```
+
+如果重建 `.venv-megatron`，`setup_uv_env.sh` 会从 `.deps/mcore-bridge` 安装 patched 源码。若 `.deps/mcore-bridge` 不存在，脚本会先 clone 上游 `modelscope/mcore-bridge` 的 `v1.4.0`，再给源码打 patch。
 
 单算子显存验证报告见：
 
@@ -274,19 +286,17 @@ max=169996
 
 ## 8. 输出与日志
 
-所有输出统一在当前目录下：
+训练脚本将 checkpoint/model 产物和日志产物分开保存：
 
 ```text
-outputs/
-logs/
-cache/
-local_cache/
+OUTPUT_DIR = ${OUTPUT_ROOT}/${RUN_NAME}
+LOG_DIR    = ${LOG_ROOT}/${RUN_NAME}
 ```
 
-27B Megatron 默认输出：
+27B Megatron 默认 checkpoint/model 输出：
 
 ```text
-outputs/qwen36-27b-paper2arm-distill-megatron/<run-name>
+/mnt/cpfs/yangyicun/data/agent_checkpoints/qwen36-27b-paper2arm-distill-megatron/<run-name>
 ```
 
 27B Megatron 默认日志：
@@ -295,7 +305,20 @@ outputs/qwen36-27b-paper2arm-distill-megatron/<run-name>
 logs/qwen36-27b-paper2arm-distill-megatron/<run-name>/train.log
 ```
 
-脚本会给 stdout/stderr 添加时间戳，便于回看训练耗时。
+日志目录内的稳定文件：
+
+```text
+train.log          # stdout/stderr，脚本会加时间戳
+logging.jsonl      # step metrics + final train_msg
+run_metadata.json  # 启动参数、环境、包版本、git 信息、关键路径
+run_summary.json   # 结束状态、best/last checkpoint
+runs/              # TensorBoard event files
+wandb/             # W&B 本地目录
+swanlab/           # SwanLab 本地目录
+images/            # TensorBoard 可视化图片
+```
+
+`OUTPUT_DIR` 只承载 checkpoint/model/args 等训练产物，避免日志和模型保存目录混在一起。
 
 ## 9. 手动验证
 
@@ -352,12 +375,17 @@ CUDA_VISIBLE_DEVICES=0 python scripts/bench_chunked_linear_ce_memory.py \
 | `RECREATE` | 重建 `.venv` 和 `.venv-megatron` | `0` |
 | `SKIP_INSTALL` | 只校验，不安装依赖 | `0` |
 | `RUN_DRY_RUN` | setup 末尾跑训练 dry-run | `1` |
-| `APPLY_CHUNKED_CE_PATCH` | setup 时自动应用 chunked CE patch | `1` |
+| `APPLY_CHUNKED_CE_PATCH` | setup 时自动应用/校验 `.deps/mcore-bridge` 源码 patch | `1` |
+| `MCORE_BRIDGE_SOURCE_DIR` | mcore-bridge 源码目录 | `.deps/mcore-bridge` |
+| `MCORE_BRIDGE_REF` | mcore-bridge checkout ref | `v1.4.0` |
 | `PYTHON_BIN` | 创建 venv 使用的 Python | `python3.12` |
 | `UV_BIN` | uv 路径 | 自动检测 |
 | `LINEAR_CE_CHUNK_SIZE` | Megatron chunked linear CE token chunk | `2048` |
+| `LINEAR_CE_DEBUG` | 打印一次 chunked linear CE debug 日志 | unset |
 | `MODEL_PATH` | 覆盖模型路径 | 脚本内默认 |
 | `DATASET_PATH` | 覆盖数据路径 | 脚本内默认 |
+| `OUTPUT_ROOT` | checkpoint/model 输出根目录 | `/mnt/cpfs/yangyicun/data/agent_checkpoints/...` |
+| `LOG_ROOT` | 日志根目录 | `logs/...` |
 | `SMOKE` | 小长度 smoke 训练 | `0` |
 | `DRY_RUN` | 只打印训练命令，不启动训练 | `0` |
 
@@ -377,12 +405,14 @@ bash setup_uv_env.sh
 RECREATE=1 bash setup_uv_env.sh
 ```
 
-### 2. 训练日志没有 `Using chunked linear CE`
+### 2. 训练日志没有 `Using supervised-token chunked linear CE`
+
+这是默认行为。生产训练默认不打印 CE 分支命中日志。
 
 确认环境变量：
 
 ```bash
-LINEAR_CE_CHUNK_SIZE=2048 DRY_RUN=1 SMOKE=1 bash train_qwen36_27b_paper2arm_distill_megatron.sh
+LINEAR_CE_DEBUG=1 LINEAR_CE_CHUNK_SIZE=2048 DRY_RUN=1 SMOKE=1 bash train_qwen36_27b_paper2arm_distill_megatron.sh
 ```
 
 确认 patch：
@@ -391,6 +421,7 @@ LINEAR_CE_CHUNK_SIZE=2048 DRY_RUN=1 SMOKE=1 bash train_qwen36_27b_paper2arm_dist
 source ./megatron_env.sh
 python - <<'PY'
 from mcore_bridge.model import gpt_model
+print(gpt_model.__file__)
 print(hasattr(gpt_model, "_ChunkedLinearCrossEntropy"))
 PY
 ```

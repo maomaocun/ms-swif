@@ -17,6 +17,7 @@ class MegatronSftArguments(MegatronBaseArguments):
 
     def _init_output_dir(self):
         init_process_group(backend=self.ddp_backend, timeout=self.ddp_timeout)
+        logger.info('startup_marker: init_process_group_done')
         if self.output_dir is None:
             self.output_dir = f'megatron_output/{self.model_suffix}'
         self.output_dir = to_abspath(self.output_dir)
@@ -45,8 +46,9 @@ class MegatronSftArguments(MegatronBaseArguments):
         if len(self.dataset) == 0 and len(self.cached_dataset) == 0:
             raise ValueError(f'self.dataset: {self.dataset}, self.cached_dataset: {self.cached_dataset}. '
                              'Please input the training dataset.')
-        if self.tensorboard_dir is None and self.output_dir is not None:
-            self.tensorboard_dir = f'{self.output_dir}/runs'
+        if self.tensorboard_dir is None:
+            log_dir = os.environ.get('SWIFT_LOG_DIR')
+            self.tensorboard_dir = os.path.join(log_dir, 'runs') if log_dir else f'{self.output_dir}/runs'
         self.tensorboard_dir = to_abspath(self.tensorboard_dir)
         if self.mcore_model is None and self.model is None and not self.perform_initialization:
             raise ValueError('You did not pass `--mcore_model/--model` to read weights, so you need to set '

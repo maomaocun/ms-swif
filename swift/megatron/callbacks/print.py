@@ -7,6 +7,7 @@ from tqdm import tqdm
 from swift.megatron.utils import reduce_max_stat_across_model_parallel_group
 from swift.utils import JsonlWriter, format_time, get_logger, is_last_rank
 from .base import MegatronCallback
+from .utils import get_logging_path
 
 logger = get_logger()
 
@@ -27,12 +28,16 @@ class PrintCallback(MegatronCallback):
         self.training_bar.update(self.state.iteration)
         self.current_step = self.state.iteration
         self.start_time = time.time()
-        logging_path = os.path.join(self.args.output_dir, 'logging.jsonl')
+        logging_path = get_logging_path(self.args)
         logger.info(f'logging_path: {logging_path}')
         self.jsonl_writer = JsonlWriter(logging_path, enable_async=True, write_on_rank='last')
 
     def on_train_end(self):
-        self.training_bar.close()
+        if self.jsonl_writer is not None:
+            self.jsonl_writer.close()
+            self.jsonl_writer = None
+        if self.training_bar is not None:
+            self.training_bar.close()
         self.training_bar = None
 
     def on_step_end(self):

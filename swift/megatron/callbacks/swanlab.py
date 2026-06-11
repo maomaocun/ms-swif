@@ -1,9 +1,7 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
-
 from swift.utils import check_json_format, is_last_rank
 from .base import MegatronCallback
-from .utils import rewrite_logs
+from .utils import get_swanlab_dir, rewrite_logs
 
 
 class SwanlabCallback(MegatronCallback):
@@ -14,7 +12,7 @@ class SwanlabCallback(MegatronCallback):
         self.config = check_json_format(vars(args))
         if args.swanlab_exp_name is None:
             args.swanlab_exp_name = args.output_dir
-        self.save_dir = os.path.join(args.output_dir, 'swanlab')
+        self.save_dir = get_swanlab_dir(args)
         self.writer = None
         self.setup()
 

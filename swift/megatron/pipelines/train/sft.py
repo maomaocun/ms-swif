@@ -1,5 +1,4 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
-import os
 import torch
 import torch.distributed as dist
 from dataclasses import asdict
@@ -7,6 +6,7 @@ from transformers.utils import is_torch_npu_available
 from typing import List, Optional, Union
 
 from swift.megatron.arguments import MegatronSftArguments
+from swift.megatron.callbacks.utils import get_images_dir, get_logging_path
 from swift.megatron.trainers import MegatronEmbeddingTrainer, MegatronRerankerTrainer, MegatronTrainer
 from swift.pipelines import SwiftSft
 from swift.utils import append_to_jsonl, get_logger, is_last_rank, plot_images
@@ -43,6 +43,7 @@ class MegatronSft(SwiftSft):
         self.train_msg = {}
         super(SwiftSft, self).__init__(args)
         args = self.args
+        logger.info('startup_marker: megatron_sft_args_ready')
         if repatch is not None:
             megatron_args = asdict(self.args)
             if args.attention_backend != 'local':
@@ -57,18 +58,29 @@ class MegatronSft(SwiftSft):
             kwargs = {'return_dummy_model': True}
         else:
             kwargs = {'load_model': False}
+        logger.info('startup_marker: model_processor_prepare_start')
         with torch.device('meta'):
             self.model, self.processor = args.get_model_processor(**kwargs, download_model=args.mcore_model is None)
+        logger.info('startup_marker: model_processor_prepare_done')
+        logger.info('startup_marker: template_prepare_start')
         self._prepare_template()
+        logger.info('startup_marker: template_prepare_done')
         args.save_args(args.output_dir)
         self.template.use_megatron = True
 
     def run(self):
         args = self.args
+        logger.info('startup_marker: dataset_prepare_start')
         train_dataset, val_dataset = self._prepare_dataset()
+        logger.info('startup_marker: dataset_prepare_done')
+        logger.info('startup_marker: init_iters_start')
         args.init_iters(train_dataset, val_dataset)
+        logger.info('startup_marker: init_iters_done')
+        logger.info('startup_marker: trainer_prepare_start')
         trainer = self.prepare_trainer()
+        logger.info('startup_marker: trainer_prepare_done')
         try:
+            logger.info('startup_marker: trainer_train_start')
             trainer.train(train_dataset, val_dataset)
         finally:
             state = trainer.state
@@ -80,11 +92,11 @@ class MegatronSft(SwiftSft):
             })
             # Visualization
             if is_last_rank():
-                images_dir = os.path.join(args.output_dir, 'images')
+                images_dir = get_images_dir(args)
                 logger.info(f'images_dir: {images_dir}')
                 plot_images(images_dir, args.tensorboard_dir)
 
-                jsonl_path = os.path.join(args.output_dir, 'logging.jsonl')
+                jsonl_path = get_logging_path(args)
                 append_to_jsonl(jsonl_path, self.train_msg, strict=False, write_on_rank='last')
         # Exceptions may cause the process to hang, preventing the exception from being propagated.
         # Therefore, destroy_process_group() should not be placed inside the finally block.

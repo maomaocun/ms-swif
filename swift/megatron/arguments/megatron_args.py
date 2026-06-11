@@ -609,6 +609,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
     num_labels: Optional[int] = None
     problem_type: Literal['regression', 'single_label_classification', 'multi_label_classification'] = None
     save_strategy: Literal['steps', 'epoch'] = 'steps'
+    skip_final_save: bool = False
     callbacks: List[str] = field(default_factory=list)
 
     @staticmethod
@@ -723,7 +724,7 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             except ImportError:
                 logger.warning('apex is not installed, so gradient accumulation fusion is disabled.')
                 self.gradient_accumulation_fusion = False
-        self.callbacks += ['print', 'default_flow']
+        self.callbacks += ['metadata', 'print', 'default_flow']
         self.callbacks += self.report_to
         if self.save_total_limit is not None:
             if self.async_save:
