@@ -203,14 +203,6 @@ if (( CONTEXT_PARALLEL_SIZE != 1 )); then
       exit 1
       ;;
   esac
-  case "${LINEAR_CE_CHUNK_SIZE,,}" in
-    ""|0|false|none|off) ;;
-    *)
-      echo "ERROR: LINEAR_CE_CHUNK_SIZE=${LINEAR_CE_CHUNK_SIZE} is not CP-safe yet." >&2
-      echo "       Use LINEAR_CE_CHUNK_SIZE=0 while validating CP; then patch chunked CE separately." >&2
-      exit 1
-      ;;
-  esac
   ALLOW_MCORE_GDN_CP="${ALLOW_MCORE_GDN_CP:-true}"
   if [[ "${CP_GDN_HEAD_CHECK,,}" == "true" && -f "${MODEL_PATH}/config.json" ]]; then
     mapfile -t qwen36_head_info < <(python3 - "${MODEL_PATH}/config.json" <<'PY'
