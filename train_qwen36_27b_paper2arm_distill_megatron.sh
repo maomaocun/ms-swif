@@ -110,7 +110,10 @@ PADDING_FREE="${PADDING_FREE:-true}"
 LAZY_TOKENIZE="${LAZY_TOKENIZE:-false}"
 LOAD_FROM_CACHE_FILE="${LOAD_FROM_CACHE_FILE:-true}"
 SPLIT_DATASET_RATIO="${SPLIT_DATASET_RATIO:-0}"
-RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-full}"
+# Default to recomputing only attention activations for better throughput.
+# If 27B SFT OOMs, fall back to full recompute on every layer; num_layers=1 means no layer interval.
+#   RECOMPUTE_GRANULARITY=full RECOMPUTE_METHOD=uniform RECOMPUTE_NUM_LAYERS=1 RECOMPUTE_MODULES=""
+RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-selective}"
 if [[ -z "${RECOMPUTE_METHOD+x}" ]]; then
   if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
     RECOMPUTE_METHOD="uniform"
@@ -125,7 +128,13 @@ if [[ -z "${RECOMPUTE_NUM_LAYERS+x}" ]]; then
     RECOMPUTE_NUM_LAYERS=""
   fi
 fi
-RECOMPUTE_MODULES="${RECOMPUTE_MODULES:-}"
+if [[ -z "${RECOMPUTE_MODULES+x}" ]]; then
+  if [[ "${RECOMPUTE_GRANULARITY}" == "selective" ]]; then
+    RECOMPUTE_MODULES="core_attn"
+  else
+    RECOMPUTE_MODULES=""
+  fi
+fi
 CROSS_ENTROPY_LOSS_FUSION="${CROSS_ENTROPY_LOSS_FUSION:-true}"
 LINEAR_CE_CHUNK_SIZE="${LINEAR_CE_CHUNK_SIZE:-2048}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
