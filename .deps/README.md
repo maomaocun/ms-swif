@@ -130,3 +130,20 @@ From the repository root:
 
 The verification script checks CUDA SM90, FA3 Hopper attention, FLA gated delta
 rule, Transformer Engine FP8 support, TE FP8 Linear, and TE FP8 SwiGLU MLP.
+
+## Qwen3.6 GDN FP8 smoke note
+
+The current local image has an ignored checkout patch under
+`.deps/mcore-bridge/src/mcore_bridge/model/modules/gated_delta_net.py`.
+For Qwen3.6 27B, Transformer Engine can internally unpad GDN projection inputs
+to a valid-token count that is not divisible by 8, which fails FP8 execution.
+The local patch honors `MCORE_GDN_DISABLE_FP8_PROJ=true` and runs only GDN
+`in_proj`/`out_proj` outside FP8 autocast, while the rest of the model can still
+use FP8.
+
+If `.deps/mcore-bridge` is recreated or reinstalled, re-apply that behavior
+before running the FP8 local smoke:
+
+```bash
+training_script/local_smoke/run_qwen36_27b_fp8_smoke.sh
+```

@@ -147,6 +147,7 @@ if [[ -z "${LINEAR_CE_CHUNK_SIZE+x}" ]]; then
   fi
 fi
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+VIT_ATTN_IMPL="${VIT_ATTN_IMPL:-}"
 TP_COMM_OVERLAP="${TP_COMM_OVERLAP:-false}"
 OVERLAP_GRAD_REDUCE="${OVERLAP_GRAD_REDUCE:-false}"
 OVERLAP_PARAM_GATHER="${OVERLAP_PARAM_GATHER:-false}"
@@ -157,6 +158,20 @@ GROUP_BY_LENGTH="${GROUP_BY_LENGTH:-false}"
 FP8_FORMAT="${FP8_FORMAT:-}"
 FP8_RECIPE="${FP8_RECIPE:-delayed}"
 FP8_PARAM_GATHER="${FP8_PARAM_GATHER:-false}"
+if [[ -z "${MCORE_GDN_PAD_TO_FP8_MULTIPLE+x}" ]]; then
+  if [[ -n "${FP8_FORMAT}" ]]; then
+    MCORE_GDN_PAD_TO_FP8_MULTIPLE=true
+  else
+    MCORE_GDN_PAD_TO_FP8_MULTIPLE=false
+  fi
+fi
+if [[ -z "${MCORE_GDN_DISABLE_FP8_PROJ+x}" ]]; then
+  if [[ -n "${FP8_FORMAT}" ]]; then
+    MCORE_GDN_DISABLE_FP8_PROJ=true
+  else
+    MCORE_GDN_DISABLE_FP8_PROJ=false
+  fi
+fi
 ASYNC_SAVE="${ASYNC_SAVE:-false}"
 SAVE_SAFETENSORS="${SAVE_SAFETENSORS:-true}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-3}"
@@ -320,6 +335,8 @@ export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${LOCAL_CACHE_ROOT}/torch_e
 export LINEAR_CE_IMPL
 export LINEAR_CE_CHUNK_SIZE
 export USE_MCORE_GDN
+export MCORE_GDN_PAD_TO_FP8_MULTIPLE
+export MCORE_GDN_DISABLE_FP8_PROJ
 export ALLOW_MCORE_GDN_CP="${ALLOW_MCORE_GDN_CP:-false}"
 
 mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${MODELSCOPE_CACHE}" "${TRITON_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}"
@@ -400,6 +417,9 @@ training_args=(
 
 if [[ -n "${MCORE_MODEL_PATH}" ]]; then
   training_args+=(--mcore_model "${MCORE_MODEL_PATH}")
+fi
+if [[ -n "${VIT_ATTN_IMPL}" ]]; then
+  training_args+=(--vit_attn_impl "${VIT_ATTN_IMPL}")
 fi
 if [[ -n "${CACHED_DATASET}" ]]; then
   training_args+=(--cached_dataset "${cached_dataset_array[@]}")
@@ -501,10 +521,12 @@ export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
   echo "Precision-aware optimizer: ${USE_PRECISION_AWARE_OPTIMIZER} main_grads=${MAIN_GRADS_DTYPE} main_params=${MAIN_PARAMS_DTYPE} exp_avg=${EXP_AVG_DTYPE} exp_avg_sq=${EXP_AVG_SQ_DTYPE}"
   echo "Cross entropy loss fusion: ${CROSS_ENTROPY_LOSS_FUSION}"
   echo "Chunked linear CE: impl=${LINEAR_CE_IMPL} chunk_size=${LINEAR_CE_CHUNK_SIZE}"
+  echo "Attention backend: ${ATTENTION_BACKEND}"
+  echo "Vision attention implementation: ${VIT_ATTN_IMPL:-<auto>}"
   echo "Recompute: granularity=${RECOMPUTE_GRANULARITY} method=${RECOMPUTE_METHOD} num_layers=${RECOMPUTE_NUM_LAYERS} modules=${RECOMPUTE_MODULES:-<default>}"
   echo "Overlap: tp_comm=${TP_COMM_OVERLAP} grad_reduce=${OVERLAP_GRAD_REDUCE} param_gather=${OVERLAP_PARAM_GATHER} param_gather_with_step=${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP}"
   echo "Data: data_sharding=${DATA_SHARDING} group_by_length=${GROUP_BY_LENGTH} packing=${PACKING} packing_length=${PACKING_LENGTH:-<auto>} padding_free=${PADDING_FREE} apply_rope_fusion=${APPLY_ROPE_FUSION} dataloader_pin_memory=${DATALOADER_PIN_MEMORY} persistent_workers=${DATALOADER_PERSISTENT_WORKERS}"
-  echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER}"
+  echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER} gdn_pad_to_multiple=${MCORE_GDN_PAD_TO_FP8_MULTIPLE} gdn_disable_fp8_proj=${MCORE_GDN_DISABLE_FP8_PROJ}"
   echo "Gradient accumulation fusion: ${GRADIENT_ACCUMULATION_FUSION}"
   echo "Async save: ${ASYNC_SAVE}"
   echo "Save safetensors: ${SAVE_SAFETENSORS}"
