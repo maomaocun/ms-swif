@@ -150,6 +150,10 @@ megatron_output/
 /sample_output/
 .qoder/
 
+# External dependency source checkouts. Keep only the reproducibility note.
+.deps/*
+!.deps/README.md
+
 # Pytorch
 *.pth
 *.pt
