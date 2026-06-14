@@ -7,9 +7,10 @@ export RUN_NAME="${RUN_NAME:-qwen36-27b-paper2arm-distill-megatron-tp8-smoke-fp8
 export FP8_FORMAT="${FP8_FORMAT:-hybrid}"
 export FP8_RECIPE="${FP8_RECIPE:-delayed}"
 
-# Qwen3.6 GDN can be unpadded inside Transformer Engine to a token count that is
-# not divisible by 8. Keep the rest of the model in FP8 and run GDN projections
-# in bf16 unless explicitly testing a fully aligned pure-FP8 GDN case.
-export MCORE_GDN_DISABLE_FP8_PROJ="${MCORE_GDN_DISABLE_FP8_PROJ:-true}"
+# Qwen3.6 GDN in_proj has a TP-local output row count of 2060, which is not a
+# valid Transformer Engine FP8 matrix dimension. Pad the outer module weight to
+# 2064 and slice the virtual channels away after projection.
+export MCORE_GDN_DISABLE_FP8_PROJ="${MCORE_GDN_DISABLE_FP8_PROJ:-false}"
+export MCORE_GDN_PAD_TO_FP8_MULTIPLE="${MCORE_GDN_PAD_TO_FP8_MULTIPLE:-true}"
 
 exec "${SCRIPT_DIR}/run_qwen36_27b_smoke.sh"

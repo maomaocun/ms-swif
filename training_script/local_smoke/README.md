@@ -39,15 +39,18 @@ Current verified local runs:
 
 - BF16: loss `0.40912953`, speed `111.570275 s/it`
 - FP8 hybrid: loss `0.39192179`, speed `66.329293 s/it`
+- FP8 hybrid with GDN weight padding: loss `0.38547987`, speed `63.980134 s/it`
 
-The FP8 path sets `MCORE_GDN_DISABLE_FP8_PROJ=true` by default. Transformer
-Engine can internally unpad Qwen3.6 GDN projection inputs to a valid-token count
-such as `2060`, which is not divisible by 8 and fails FP8 execution. This keeps
-the rest of the Transformer Engine model in FP8 while running GDN projections in
-bf16. To test pure GDN FP8 on an aligned batch, set:
+The FP8 path sets `MCORE_GDN_DISABLE_FP8_PROJ=false` and
+`MCORE_GDN_PAD_TO_FP8_MULTIPLE=true` by default. Qwen3.6 GDN `in_proj` has a
+TP-local output row count of `2060`, which is not a valid Transformer Engine FP8
+matrix dimension. The local mcore-bridge patch pads that outer module weight to
+`2064`, runs the projection in FP8, then slices the virtual channels away before
+the GDN split/reshape logic sees them. To compare against the conservative
+workaround that keeps only GDN projections in bf16, set:
 
 ```bash
-MCORE_GDN_DISABLE_FP8_PROJ=false training_script/local_smoke/run_qwen36_27b_fp8_smoke.sh
+MCORE_GDN_DISABLE_FP8_PROJ=true training_script/local_smoke/run_qwen36_27b_fp8_smoke.sh
 ```
 
 Padding and loss masking:
@@ -55,6 +58,6 @@ Padding and loss masking:
 - Swift's Megatron collator pads `input_ids`, `attention_mask`, and `labels` to
   the required multiple from `get_padding_to(args)`.
 - Label padding uses `-100`, so padded positions are ignored by CE loss.
-- The GDN FP8 issue is downstream of the collator: Megatron/TE can compress to
-  valid tokens before the GDN projection, so dataset-level padding alone does not
-  guarantee FP8's token-multiple requirement inside that projection.
+- The GDN FP8 issue is not fixed by dataset padding because the failing `2060`
+  dimension is the TP-local `in_proj.weight` output row count, not the number of
+  input tokens in the cached sample.

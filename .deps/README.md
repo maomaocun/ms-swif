@@ -31,12 +31,28 @@ git -C .deps/flash-attention checkout fc8cbad6b6b90220cf6ef8121c29e299a3ba7d9a
 git clone https://github.com/fla-org/flash-linear-attention .deps/flash-linear-attention
 git -C .deps/flash-linear-attention checkout c525f4957f11a6f197b52c0c222377446c3eab56
 
-git clone https://github.com/modelscope/mcore-bridge.git .deps/mcore-bridge
-git -C .deps/mcore-bridge checkout df06ab3b12ad1f84f18798026269ca83b12f8621
+git clone https://github.com/maomaocun/mcore-bridge .deps/mcore-bridge
+git -C .deps/mcore-bridge checkout 9b6dd2e9de3b015721a73897ecd31f02f10213c2
 
 git clone --filter=blob:none https://github.com/NVIDIA/Megatron-LM.git .deps/Megatron-LM
 git -C .deps/Megatron-LM checkout aa1057124ef53e99cbfc799c916ad948824bbff6
 ```
+
+Current local dependency sync status:
+
+- `flash-attention`: clean, `origin/main` at
+  `fc8cbad6b6b90220cf6ef8121c29e299a3ba7d9a`, no local-only commits.
+- `flash-linear-attention`: clean, `origin/main` at
+  `c525f4957f11a6f197b52c0c222377446c3eab56`, no local-only commits.
+- `Megatron-LM`: clean, `origin/main` at
+  `aa1057124ef53e99cbfc799c916ad948824bbff6`, no local-only commits.
+- `mcore-bridge`: clean local branch `gdn-fp8-weightpad` at
+  `9b6dd2e9de3b015721a73897ecd31f02f10213c2`. Relative to
+  `https://github.com/maomaocun/mcore-bridge` `origin/main`
+  (`cebb791f0e5e04ce162f5eed2d29e526b98ee9c5`), this branch has 16
+  local-only commits and is missing 33 commits from `origin/main`.
+  Push `gdn-fp8-weightpad` before relying on the checkout command above on a
+  fresh machine.
 
 If direct GitHub access is unavailable on the target machine, clone these
 repositories on a machine that can access GitHub and copy the resulting
@@ -133,17 +149,55 @@ rule, Transformer Engine FP8 support, TE FP8 Linear, and TE FP8 SwiGLU MLP.
 
 ## Qwen3.6 GDN FP8 smoke note
 
-The current local image has an ignored checkout patch under
-`.deps/mcore-bridge/src/mcore_bridge/model/modules/gated_delta_net.py`.
-For Qwen3.6 27B, Transformer Engine can internally unpad GDN projection inputs
-to a valid-token count that is not divisible by 8, which fails FP8 execution.
-The local patch honors `MCORE_GDN_DISABLE_FP8_PROJ=true` and runs only GDN
-`in_proj`/`out_proj` outside FP8 autocast, while the rest of the model can still
-use FP8.
+The current local image uses the `mcore-bridge` branch `gdn-fp8-weightpad`.
+For Qwen3.6 27B with TP=8, GDN `in_proj.weight` has a local output row count of
+`2060`, which is not divisible by 8 and fails Transformer Engine FP8 execution.
+This is a TP-local weight shape issue, not a dataset token-padding issue.
 
-If `.deps/mcore-bridge` is recreated or reinstalled, re-apply that behavior
-before running the FP8 local smoke:
+The local patch pads that outer module weight from `2060` to `2064`, runs the
+projection in FP8, then slices the virtual channels away before GDN split/reshape
+logic sees them. HF-to-MCore loading pads the corresponding TP chunks, and
+MCore-to-HF export strips the virtual padded rows.
+
+If `.deps/mcore-bridge` is recreated or reinstalled, re-apply that behavior and
+install it into `/usr/local/bin/python` before running the FP8 local smoke:
 
 ```bash
 training_script/local_smoke/run_qwen36_27b_fp8_smoke.sh
 ```
+
+ModelScope's documented Qwen3.5/Qwen3-Next FP8 route uses
+`--linear_decoupled_in_proj true`, `--fp8_recipe blockwise`,
+`--fp8_format e4m3`, and `--fp8_param_gather true`. This keeps `in_proj_ba` in
+the original precision and mainly places FP8 around TE linear projection paths;
+it does not make the gated-delta-rule recurrent kernel itself FP8.
+
+The verified local Qwen3.6 27B smoke used `FP8_FORMAT=hybrid`,
+`FP8_RECIPE=delayed`, `FP8_PARAM_GATHER=false`, and the local GDN weight-padding
+patch, so it is conceptually aligned with FP8-on-TE-projections but not
+identical to the ModelScope example settings. To test the documented route with
+the local training script, set:
+
+```bash
+LINEAR_DECOUPLED_IN_PROJ=true \
+FP8_FORMAT=e4m3 \
+FP8_RECIPE=blockwise \
+FP8_PARAM_GATHER=true \
+training_script/local_smoke/run_qwen36_27b_smoke.sh
+```
+
+## Apex note
+
+Apex is not installed in this image. Transformer Engine `2.9.0` is installed,
+but Megatron Core `0.17.1` tries to import
+`transformer_engine.pytorch.optimizers.multi_tensor_scale_tensor`, which this TE
+build does not export. Megatron then tries Apex (`amp_C` and
+`apex.multi_tensor_apply`), does not find it, and falls back to local
+multi-tensor helpers.
+
+Megatron-SWIFT can run without Apex when `--gradient_accumulation_fusion false`
+is used, which is the current local script default. Installing Apex is possible
+but not required for the validated smoke path; it requires building
+`NVIDIA/apex` against the exact active PyTorch/CUDA toolchain with `--cpp_ext`
+and `--cuda_ext`, and failures are common when the compiler, CUDA toolkit, or
+PyTorch ABI are mismatched.

@@ -158,6 +158,7 @@ GROUP_BY_LENGTH="${GROUP_BY_LENGTH:-false}"
 FP8_FORMAT="${FP8_FORMAT:-}"
 FP8_RECIPE="${FP8_RECIPE:-delayed}"
 FP8_PARAM_GATHER="${FP8_PARAM_GATHER:-false}"
+LINEAR_DECOUPLED_IN_PROJ="${LINEAR_DECOUPLED_IN_PROJ:-false}"
 if [[ -z "${MCORE_GDN_PAD_TO_FP8_MULTIPLE+x}" ]]; then
   if [[ -n "${FP8_FORMAT}" ]]; then
     MCORE_GDN_PAD_TO_FP8_MULTIPLE=true
@@ -167,7 +168,7 @@ if [[ -z "${MCORE_GDN_PAD_TO_FP8_MULTIPLE+x}" ]]; then
 fi
 if [[ -z "${MCORE_GDN_DISABLE_FP8_PROJ+x}" ]]; then
   if [[ -n "${FP8_FORMAT}" ]]; then
-    MCORE_GDN_DISABLE_FP8_PROJ=true
+    MCORE_GDN_DISABLE_FP8_PROJ=false
   else
     MCORE_GDN_DISABLE_FP8_PROJ=false
   fi
@@ -462,6 +463,7 @@ fi
 if [[ -n "${FP8_FORMAT}" ]]; then
   training_args+=(--fp8_format "${FP8_FORMAT}" --fp8_recipe "${FP8_RECIPE}" --fp8_param_gather "${FP8_PARAM_GATHER}")
 fi
+training_args+=(--linear_decoupled_in_proj "${LINEAR_DECOUPLED_IN_PROJ}")
 if [[ -n "${TRAIN_ITERS}" ]]; then
   training_args+=(--train_iters "${TRAIN_ITERS}")
 fi
@@ -526,7 +528,7 @@ export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
   echo "Recompute: granularity=${RECOMPUTE_GRANULARITY} method=${RECOMPUTE_METHOD} num_layers=${RECOMPUTE_NUM_LAYERS} modules=${RECOMPUTE_MODULES:-<default>}"
   echo "Overlap: tp_comm=${TP_COMM_OVERLAP} grad_reduce=${OVERLAP_GRAD_REDUCE} param_gather=${OVERLAP_PARAM_GATHER} param_gather_with_step=${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP}"
   echo "Data: data_sharding=${DATA_SHARDING} group_by_length=${GROUP_BY_LENGTH} packing=${PACKING} packing_length=${PACKING_LENGTH:-<auto>} padding_free=${PADDING_FREE} apply_rope_fusion=${APPLY_ROPE_FUSION} dataloader_pin_memory=${DATALOADER_PIN_MEMORY} persistent_workers=${DATALOADER_PERSISTENT_WORKERS}"
-  echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER} gdn_pad_to_multiple=${MCORE_GDN_PAD_TO_FP8_MULTIPLE} gdn_disable_fp8_proj=${MCORE_GDN_DISABLE_FP8_PROJ}"
+  echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER} linear_decoupled_in_proj=${LINEAR_DECOUPLED_IN_PROJ} gdn_pad_to_multiple=${MCORE_GDN_PAD_TO_FP8_MULTIPLE} gdn_disable_fp8_proj=${MCORE_GDN_DISABLE_FP8_PROJ}"
   echo "Gradient accumulation fusion: ${GRADIENT_ACCUMULATION_FUSION}"
   echo "Async save: ${ASYNC_SAVE}"
   echo "Save safetensors: ${SAVE_SAFETENSORS}"
