@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 from swift.utils import check_json_format, get_dist_setting, get_logger, is_last_rank
 from .base import MegatronCallback
 from .utils import (get_images_dir, get_log_dir, get_logging_path, get_run_metadata_path, get_run_summary_path,
-                    get_swanlab_dir, get_tensorboard_dir, get_wandb_dir)
+                    get_swanlab_dir, get_tensorboard_dir, get_wandb_dir, is_logging_jsonl_disabled)
 
 logger = get_logger()
 
@@ -51,7 +51,14 @@ _ENV_KEYS = [
     'SWIFT_OUTPUT_DIR',
     'SWIFT_LOG_DIR',
     'SWIFT_LOG_FILE',
+    'SWIFT_STEP_METRICS_LOG_FILE',
     'SWIFT_LAUNCH_COMMAND',
+    'SWIFT_DISABLE_LOGGING_JSONL',
+    'SWIFT_TIMING_SYNC_CUDA',
+    'SWIFT_MFU_MODEL_PARAMS',
+    'SWIFT_MFU_DEVICE_TFLOPS',
+    'MFU_MODEL_PARAMS',
+    'MFU_DEVICE_TFLOPS',
 ]
 
 _PACKAGE_NAMES = [
@@ -74,11 +81,32 @@ _MODEL_CONFIG_FIELDS = [
     'hidden_size',
     'num_attention_heads',
     'num_query_groups',
+    'kv_channels',
     'ffn_hidden_size',
     'padded_vocab_size',
+    'swiglu',
+    'attention_output_gate',
+    'multi_latent_attention',
+    'q_lora_rank',
+    'kv_lora_rank',
+    'qk_head_dim',
+    'qk_pos_emb_head_dim',
+    'v_head_dim',
     'max_position_embeddings',
     'attention_backend',
     'experimental_attention_variant',
+    'linear_attention_freq',
+    'linear_key_head_dim',
+    'linear_value_head_dim',
+    'linear_num_key_heads',
+    'linear_num_value_heads',
+    'linear_conv_kernel_dim',
+    'num_moe_experts',
+    'moe_layer_freq',
+    'moe_router_topk',
+    'moe_ffn_hidden_size',
+    'moe_shared_expert_intermediate_size',
+    'moe_latent_size',
     'tensor_model_parallel_size',
     'pipeline_model_parallel_size',
     'context_parallel_size',
@@ -203,7 +231,8 @@ class MetadataCallback(MegatronCallback):
                 'swanlab_dir': get_swanlab_dir(self.args),
                 'images_dir': get_images_dir(self.args),
                 'train_log': os.environ.get('SWIFT_LOG_FILE'),
-                'logging_jsonl': get_logging_path(self.args),
+                'step_metrics_log': os.environ.get('SWIFT_STEP_METRICS_LOG_FILE'),
+                'logging_jsonl': None if is_logging_jsonl_disabled() else get_logging_path(self.args),
                 'run_metadata': self.metadata_path,
                 'run_summary': self.summary_path,
                 'mcore_bridge_root': str(mcore_root) if mcore_root else None,
@@ -238,5 +267,7 @@ class MetadataCallback(MegatronCallback):
             'last_model_checkpoint': getattr(self.state, 'last_model_checkpoint', None),
             'best_model_checkpoint': getattr(self.state, 'best_model_checkpoint', None),
             'best_metric': getattr(self.state, 'best_metric', None),
+            'last_train_metrics': getattr(self.state, 'last_train_metrics', None),
+            'last_log_metrics': getattr(self.state, 'last_log_metrics', None),
         }
         _write_json(self.summary_path, summary)

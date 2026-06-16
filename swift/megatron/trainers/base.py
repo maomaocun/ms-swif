@@ -5,6 +5,7 @@ import megatron.core
 import operator
 import os
 import shutil
+import time
 import torch
 import torch.nn
 from abc import ABC, abstractmethod
@@ -63,11 +64,23 @@ def _format_model_config_summary(config) -> str:
         'hidden_size',
         'num_attention_heads',
         'num_query_groups',
+        'kv_channels',
         'ffn_hidden_size',
         'padded_vocab_size',
+        'swiglu',
+        'attention_output_gate',
         'max_position_embeddings',
         'attention_backend',
         'experimental_attention_variant',
+        'linear_attention_freq',
+        'linear_key_head_dim',
+        'linear_value_head_dim',
+        'linear_num_key_heads',
+        'linear_num_value_heads',
+        'linear_conv_kernel_dim',
+        'num_moe_experts',
+        'moe_layer_freq',
+        'moe_router_topk',
         'tensor_model_parallel_size',
         'pipeline_model_parallel_size',
         'context_parallel_size',
@@ -171,13 +184,21 @@ class BaseMegatronTrainer(ABC):
     def on_log(self, logs, prefix=''):
         n_steps = logs.pop('n_steps')
         self._log_callback(logs, n_steps)
+        if not prefix:
+            logs.setdefault('logged_steps', n_steps)
         if prefix:
             logs = {f'{prefix}{k}': v for k, v in logs.items()}
+        self.state.last_log_metrics = dict(logs)
+        if not prefix:
+            self.state.last_train_metrics = dict(logs)
         self.call_event('on_log', logs=logs)
 
     def _log_callback(self, logs, n_steps):
         args = self.args
         config = self.config
+        loss_for_tokens = logs.get('loss')
+        if isinstance(loss_for_tokens, torch.Tensor) and loss_for_tokens.numel() == 2:
+            logs.setdefault('num_tokens', loss_for_tokens[1].detach().clone())
         if config.num_moe_experts is not None:
             moe_loss_scale = 1 / args.num_microbatches / n_steps
             track_names = []
@@ -224,6 +245,110 @@ class BaseMegatronTrainer(ABC):
                     v = v[0] / v[1]
                 v = v.item()
             logs[k] = v
+
+    @staticmethod
+    def _timing_sync_cuda() -> None:
+        if os.environ.get('SWIFT_TIMING_SYNC_CUDA', '1').lower() not in {'1', 'true', 'yes', 'on'}:
+            return
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    @classmethod
+    def _timing_now(cls) -> float:
+        cls._timing_sync_cuda()
+        return time.perf_counter()
+
+    @staticmethod
+    def _accumulate_avg_metric(total_metrics, key: str, value: Optional[float]):
+        if value is None:
+            return
+        if key not in total_metrics:
+            total_metrics[key] = torch.tensor([0.0, 0.0], dtype=torch.float32, device=torch.cuda.current_device())
+        total_metrics[key] += torch.tensor([float(value), 1.0], dtype=torch.float32, device=torch.cuda.current_device())
+
+    @staticmethod
+    def _accumulate_sum_metric(total_metrics, key: str, value: Optional[float]):
+        if value is None:
+            return
+        total_metrics[key] = float(total_metrics.get(key, 0.0)) + float(value)
+
+    @staticmethod
+    def _accumulate_max_metric(total_metrics, key: str, value: Optional[float]):
+        if value is None:
+            return
+        total_metrics[key] = max(float(total_metrics.get(key, 0.0)), float(value))
+
+    @staticmethod
+    def _infer_token_count(data) -> int:
+        input_ids = data.get('input_ids') if isinstance(data, dict) else None
+        if isinstance(input_ids, torch.Tensor):
+            return int(input_ids.numel())
+        if isinstance(input_ids, list):
+            return sum(len(row) if isinstance(row, (list, tuple)) else 1 for row in input_ids)
+        return 0
+
+    @staticmethod
+    def _get_first(data, keys):
+        if not isinstance(data, dict):
+            return None
+        for key in keys:
+            if key in data and data[key] is not None:
+                return data[key]
+        return None
+
+    @classmethod
+    def _packed_position_lengths(cls, position_ids):
+        if not isinstance(position_ids, torch.Tensor) or position_ids.numel() == 0:
+            return None
+        position_ids = position_ids.flatten()
+        indices = torch.arange(position_ids.shape[0], device=position_ids.device, dtype=torch.int64)
+        start_indices = indices[position_ids == 0]
+        if start_indices.numel() == 0:
+            return position_ids.new_tensor([position_ids.numel()], dtype=torch.int64)
+        end_indices = torch.cat([start_indices[1:], position_ids.new_tensor([position_ids.numel()], dtype=torch.int64)])
+        return end_indices - start_indices
+
+    def _infer_sequence_length_stats(self, data) -> Dict[str, float]:
+        if not isinstance(data, dict):
+            return {}
+        seq_lens = None
+        if getattr(self.args, 'padding_free', False):
+            cu_seqlens = self._get_first(data, ['cu_seq_lens_q', 'cu_seqlens_q'])
+            if isinstance(cu_seqlens, torch.Tensor) and cu_seqlens.numel() > 1:
+                seq_lens = cu_seqlens.flatten()[1:] - cu_seqlens.flatten()[:-1]
+            else:
+                position_ids = self._get_first(data, ['text_position_ids'])
+                if position_ids is None and 'position_ids' in data:
+                    candidate = data['position_ids']
+                    if isinstance(candidate, torch.Tensor) and candidate.dim() >= 1 and candidate.shape[0] == 1:
+                        position_ids = candidate
+                seq_lens = self._packed_position_lengths(position_ids)
+
+        if seq_lens is None:
+            attention_mask = self._get_first(data, ['attention_mask_2d', 'attention_mask'])
+            if isinstance(attention_mask, torch.Tensor) and attention_mask.numel() > 0:
+                if attention_mask.dim() == 4:
+                    seq_lens = (~attention_mask[:, 0, -1]).sum(dim=-1)
+                elif attention_mask.dim() == 2:
+                    seq_lens = attention_mask.to(torch.int64).sum(dim=-1)
+        if seq_lens is None:
+            input_ids = data.get('input_ids')
+            if isinstance(input_ids, torch.Tensor) and input_ids.numel() > 0:
+                if input_ids.dim() == 1:
+                    seq_lens = input_ids.new_tensor([input_ids.shape[0]], dtype=torch.int64)
+                else:
+                    seq_lens = input_ids.new_full((input_ids.shape[0], ), input_ids.shape[-1], dtype=torch.int64)
+        if seq_lens is None or seq_lens.numel() == 0:
+            return {}
+
+        seq_lens = seq_lens.to(dtype=torch.float64)
+        seq_len_sum = seq_lens.sum()
+        return {
+            'seq_len_sum': float(seq_len_sum.item()),
+            '_attention_seq_len_sq_sum': float((seq_lens * seq_lens).sum().item()),
+            'num_sequences': float(seq_lens.numel()),
+            'max_seq_len': float(seq_lens.max().item()),
+        }
 
     def prepare_model(self):
         args = self.args
@@ -676,6 +801,7 @@ class BaseMegatronTrainer(ABC):
 
         self.call_event('on_train_begin')
         train_metrics = {}
+        first_iteration_to_log = state.iteration + 1
         if args.virtual_pipeline_model_parallel_size is not None:
             train_data_iterator, val_data_iterator = [], []
             for _ in range(args.virtual_pipeline_model_parallel_size):
@@ -687,7 +813,8 @@ class BaseMegatronTrainer(ABC):
         while state.iteration < args.train_iters:
             self.call_event('on_step_begin')
             maybe_finalize_async_save(args, blocking=False)
-            metrics, grad_norm, update_successful = self.train_step(train_data_iterator)
+            step_wall_start = self._timing_now()
+            metrics, grad_norm, update_successful, step_timings = self.train_step(train_data_iterator)
             if state.iteration == start_iteration:
                 if update_successful:
                     # Enable forward pre-hook after training step has successfully run. All subsequent
@@ -702,6 +829,7 @@ class BaseMegatronTrainer(ABC):
 
             state.iteration += 1
             self.call_event('on_step_end')
+            metric_prepare_start = self._timing_now()
             self._aggregated_metrics(metrics, train_metrics)
             train_metrics['grad_norm'] = grad_norm
             learning_rate = None
@@ -711,6 +839,19 @@ class BaseMegatronTrainer(ABC):
                 learning_rate = param_group['lr']
             if learning_rate is not None:
                 train_metrics['learning_rate'] = learning_rate
+            step_timings['metric_prepare_s'] = self._timing_now() - metric_prepare_start
+            step_timings['step_time_s'] = self._timing_now() - step_wall_start
+            total_tokens = step_timings.pop('total_tokens', None)
+            self._accumulate_sum_metric(train_metrics, 'total_tokens', total_tokens)
+            for stat_key in ['seq_len_sum', '_attention_seq_len_sq_sum', 'num_sequences']:
+                self._accumulate_sum_metric(train_metrics, stat_key, step_timings.pop(stat_key, None))
+            self._accumulate_max_metric(train_metrics, 'max_seq_len', step_timings.pop('max_seq_len', None))
+            for timing_key, timing_value in step_timings.items():
+                self._accumulate_avg_metric(train_metrics, f'timing/{timing_key}', timing_value)
+                if timing_key == 'step_time_s':
+                    self._accumulate_avg_metric(train_metrics, 'step_time_s', timing_value)
+            if state.iteration == first_iteration_to_log or (args.logging_steps and state.iteration % args.logging_steps == 0):
+                state.should_log = True
             if state.should_log:
                 state.should_log = False
                 self.on_log(logs=train_metrics)
@@ -921,15 +1062,30 @@ class BaseMegatronTrainer(ABC):
     def train_step(self, train_data_iterator):
         args = self.args
         forward_backward_func = get_forward_backward_func()
+        step_timing = {
+            'dataloader_next_s': 0.0,
+            'batch_prepare_s': 0.0,
+            'batch_fetch_s': 0.0,
+            'total_tokens': 0.0,
+            'seq_len_sum': 0.0,
+            '_attention_seq_len_sq_sum': 0.0,
+            'num_sequences': 0.0,
+            'max_seq_len': 0.0,
+        }
+        self._current_step_timing = step_timing
+        train_step_start = self._timing_now()
+        zero_grad_start = train_step_start
         for m in self.wrapped_models:
             m.zero_grad_buffer()
         self.optimizer.zero_grad()
+        step_timing['zero_grad_s'] = self._timing_now() - zero_grad_start
         # TODO: refactor _replace_data_iterator
         data_iterator = self._replace_data_iterator(train_data_iterator)
 
         if self.enable_routing_replay:
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
+        forward_backward_start = self._timing_now()
         metrics = forward_backward_func(
             forward_step_func=self.forward_step,
             data_iterator=data_iterator,
@@ -939,18 +1095,46 @@ class BaseMegatronTrainer(ABC):
             micro_batch_size=args.micro_batch_size,
             forward_only=False,
         )
+        step_timing['forward_backward_s'] = self._timing_now() - forward_backward_start
 
+        optimizer_start = self._timing_now()
         update_successful, grad_norm, _ = self.optimizer.step()
+        step_timing['optimizer_step_s'] = self._timing_now() - optimizer_start
+        optimizer_reduce_start = self._timing_now()
         update_successful = logical_and_across_model_parallel_group(update_successful)
         grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+        step_timing['optimizer_reduce_s'] = self._timing_now() - optimizer_reduce_start
         if update_successful:
+            lr_scheduler_start = self._timing_now()
             self.opt_param_scheduler.step(increment=args.global_batch_size)
+            step_timing['lr_scheduler_s'] = self._timing_now() - lr_scheduler_start
+        else:
+            step_timing['lr_scheduler_s'] = 0.0
 
         if self.enable_routing_replay:
             RouterReplay.clear_global_router_replay_action()
             RouterReplay.clear_global_indices()
 
-        return metrics, grad_norm, update_successful
+        total_tokens = step_timing.get('total_tokens', 0.0)
+        if torch.distributed.is_initialized():
+            total_tokens_tensor = torch.tensor(total_tokens, dtype=torch.float32, device=torch.cuda.current_device())
+            torch.distributed.all_reduce(
+                total_tokens_tensor, group=mpu.get_data_parallel_group(with_context_parallel=True))
+            step_timing['total_tokens'] = total_tokens_tensor.item()
+            for key in ['seq_len_sum', '_attention_seq_len_sq_sum', 'num_sequences']:
+                value_tensor = torch.tensor(
+                    step_timing.get(key, 0.0), dtype=torch.float64, device=torch.cuda.current_device())
+                torch.distributed.all_reduce(value_tensor, group=mpu.get_data_parallel_group(with_context_parallel=True))
+                step_timing[key] = value_tensor.item()
+            max_seq_len_tensor = torch.tensor(
+                step_timing.get('max_seq_len', 0.0), dtype=torch.float64, device=torch.cuda.current_device())
+            torch.distributed.all_reduce(
+                max_seq_len_tensor, op=torch.distributed.ReduceOp.MAX,
+                group=mpu.get_data_parallel_group(with_context_parallel=True))
+            step_timing['max_seq_len'] = max_seq_len_tensor.item()
+        step_timing['train_step_s'] = self._timing_now() - train_step_start
+        self._current_step_timing = None
+        return metrics, grad_norm, update_successful, step_timing
 
     def _aggregated_metrics(self, metrics, total_metrics):
         if 'n_steps' not in total_metrics:
@@ -1049,7 +1233,28 @@ class BaseMegatronTrainer(ABC):
 
     def get_batch(self, data_iterator, vp_stage=None):
         """Generate a batch."""
-        return self._prepare_batch(next(data_iterator), vp_stage)
+        dataloader_start = time.perf_counter()
+        data = next(data_iterator)
+        dataloader_done = time.perf_counter()
+        total_tokens = self._infer_token_count(data)
+        sequence_stats = self._infer_sequence_length_stats(data)
+        prepare_start = time.perf_counter()
+        batch = self._prepare_batch(data, vp_stage)
+        prepare_done = time.perf_counter()
+        step_timing = getattr(self, '_current_step_timing', None)
+        if step_timing is not None:
+            dataloader_next_s = dataloader_done - dataloader_start
+            batch_prepare_s = prepare_done - prepare_start
+            step_timing['dataloader_next_s'] += dataloader_next_s
+            step_timing['batch_prepare_s'] += batch_prepare_s
+            step_timing['batch_fetch_s'] += dataloader_next_s + batch_prepare_s
+            step_timing['total_tokens'] += total_tokens
+            for key, value in sequence_stats.items():
+                if key == 'max_seq_len':
+                    step_timing[key] = max(step_timing.get(key, 0.0), value)
+                else:
+                    step_timing[key] = step_timing.get(key, 0.0) + value
+        return batch
 
     def _collect_config_info(self) -> Dict[str, str]:
         """

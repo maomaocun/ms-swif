@@ -112,10 +112,11 @@ APPLY_ROPE_FUSION="${APPLY_ROPE_FUSION:-false}"
 LAZY_TOKENIZE="${LAZY_TOKENIZE:-false}"
 LOAD_FROM_CACHE_FILE="${LOAD_FROM_CACHE_FILE:-true}"
 SPLIT_DATASET_RATIO="${SPLIT_DATASET_RATIO:-0}"
-# Default to recomputing only attention activations for better throughput.
-# If 27B SFT OOMs, fall back to full recompute on every layer; num_layers=1 means no layer interval.
+DATASET_SHUFFLE="${DATASET_SHUFFLE:-true}"
+# Default to full activation recompute for long trajectory SFT memory headroom.
+# num_layers=1 means no layer interval.
 #   RECOMPUTE_GRANULARITY=full RECOMPUTE_METHOD=uniform RECOMPUTE_NUM_LAYERS=1 RECOMPUTE_MODULES=""
-RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-selective}"
+RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-full}"
 if [[ -z "${RECOMPUTE_METHOD+x}" ]]; then
   if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
     RECOMPUTE_METHOD="uniform"
@@ -139,6 +140,7 @@ if [[ -z "${RECOMPUTE_MODULES+x}" ]]; then
 fi
 CROSS_ENTROPY_LOSS_FUSION="${CROSS_ENTROPY_LOSS_FUSION:-true}"
 LINEAR_CE_IMPL="${LINEAR_CE_IMPL:-torch}"
+LINEAR_CE_DEBUG="${LINEAR_CE_DEBUG:-1}"
 if [[ -z "${LINEAR_CE_CHUNK_SIZE+x}" ]]; then
   if (( CONTEXT_PARALLEL_SIZE != 1 )); then
     LINEAR_CE_CHUNK_SIZE=0
@@ -180,7 +182,7 @@ LOGGING_STEPS="${LOGGING_STEPS:-1}"
 DATALOADER_PIN_MEMORY="${DATALOADER_PIN_MEMORY:-true}"
 DATALOADER_PERSISTENT_WORKERS="${DATALOADER_PERSISTENT_WORKERS:-false}"
 DDP_TIMEOUT="${DDP_TIMEOUT:-3600000}"
-REPORT_TO="${REPORT_TO:-tensorboard}"
+REPORT_TO="${REPORT_TO:-wandb}"
 export WANDB_PROJECT="${WANDB_PROJECT:-agent-distillation-training}"
 export WANDB_ENTITY="${WANDB_ENTITY:-infinite-frontier}"
 WANDB_PROJECT_NAME="${WANDB_PROJECT_NAME:-${WANDB_PROJECT}}"
@@ -204,9 +206,12 @@ if [[ "${restore_xtrace}" == "1" ]]; then
   set -x
 fi
 unset restore_xtrace
-if [[ "${REPORT_TO}" == *wandb* && -z "${WANDB_API_KEY:-}" ]]; then
-  echo "ERROR: REPORT_TO includes wandb, but WANDB_API_KEY is unset and ${WANDB_API_KEY_FILE} is missing." >&2
-  exit 1
+if [[ "${REPORT_TO}" == *wandb* ]]; then
+  export WANDB_DISABLED=false
+  if [[ -z "${WANDB_API_KEY:-}" ]]; then
+    echo "ERROR: REPORT_TO includes wandb, but WANDB_API_KEY is unset and ${WANDB_API_KEY_FILE} is missing." >&2
+    exit 1
+  fi
 fi
 
 TOTAL_MODEL_PARALLEL=$((TENSOR_MODEL_PARALLEL_SIZE * PIPELINE_MODEL_PARALLEL_SIZE * CONTEXT_PARALLEL_SIZE))
@@ -331,19 +336,166 @@ export MASTER_PORT
 export HF_HOME="${HF_HOME:-${CACHE_ROOT}/huggingface}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${CACHE_ROOT}/datasets}"
 export MODELSCOPE_CACHE="${MODELSCOPE_CACHE:-${CACHE_ROOT}/modelscope}"
-export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-${LOCAL_CACHE_ROOT}/triton}"
-export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-${LOCAL_CACHE_ROOT}/torch_extensions}"
 export LINEAR_CE_IMPL
 export LINEAR_CE_CHUNK_SIZE
+export LINEAR_CE_DEBUG
 export USE_MCORE_GDN
 export MCORE_GDN_PAD_TO_FP8_MULTIPLE
 export MCORE_GDN_DISABLE_FP8_PROJ
 export ALLOW_MCORE_GDN_CP="${ALLOW_MCORE_GDN_CP:-false}"
 
-mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${MODELSCOPE_CACHE}" "${TRITON_CACHE_DIR}" "${TORCH_EXTENSIONS_DIR}"
+mkdir -p "${HF_HOME}" "${HF_DATASETS_CACHE}" "${MODELSCOPE_CACHE}"
+if [[ -n "${TRITON_CACHE_DIR:-}" ]]; then
+  export TRITON_CACHE_DIR
+  mkdir -p "${TRITON_CACHE_DIR}"
+fi
+if [[ -n "${TORCH_EXTENSIONS_DIR:-}" ]]; then
+  export TORCH_EXTENSIONS_DIR
+  mkdir -p "${TORCH_EXTENSIONS_DIR}"
+fi
 
 timestamp_output() {
   awk '{ print strftime("[%Y-%m-%d %H:%M:%S]"), $0; fflush(); }'
+}
+
+log_stream() {
+  if [[ "${LOG_ALREADY_TEE:-0}" == "1" ]]; then
+    timestamp_output
+  else
+    timestamp_output | tee -a "${LOG_FILE}"
+  fi
+}
+
+epoch_seconds() {
+  date +%s
+}
+
+elapsed_seconds() {
+  local start_epoch="$1"
+  local end_epoch="${2:-$(epoch_seconds)}"
+  echo $((end_epoch - start_epoch))
+}
+
+log_child_stream() {
+  local start_epoch="$1"
+  local first_output_marker="${2:-}"
+  if [[ "${LOG_ALREADY_TEE:-0}" == "1" ]]; then
+    awk -v start_epoch="${start_epoch}" -v first_output_marker="${first_output_marker}" '
+      BEGIN { first = 1 }
+      {
+        if (first) {
+          first = 0
+          if (first_output_marker != "") {
+            system("touch " first_output_marker)
+          }
+          printf "%s startup_marker: torchrun_first_output delay_s=%d\n",
+                 strftime("[%Y-%m-%d %H:%M:%S]"), systime() - start_epoch
+        }
+        print strftime("[%Y-%m-%d %H:%M:%S]"), $0
+        fflush()
+      }'
+  else
+    awk -v start_epoch="${start_epoch}" -v first_output_marker="${first_output_marker}" '
+      BEGIN { first = 1 }
+      {
+        if (first) {
+          first = 0
+          if (first_output_marker != "") {
+            system("touch " first_output_marker)
+          }
+          printf "%s startup_marker: torchrun_first_output delay_s=%d\n",
+                 strftime("[%Y-%m-%d %H:%M:%S]"), systime() - start_epoch
+        }
+        print strftime("[%Y-%m-%d %H:%M:%S]"), $0
+        fflush()
+      }' | tee -a "${LOG_FILE}"
+  fi
+}
+
+run_command_with_heartbeat() {
+  local start_epoch="$1"
+  shift
+  local heartbeat_interval="${SWIFT_TORCHRUN_HEARTBEAT_INTERVAL_SECONDS:-30}"
+  local heartbeat_dir="${TMPDIR:-/tmp}"
+  local first_output_marker
+  local output_fifo
+  first_output_marker="$(mktemp "${heartbeat_dir}/swift-first-output.XXXXXX")"
+  output_fifo="$(mktemp -u "${heartbeat_dir}/swift-child-output.XXXXXX")"
+  rm -f "${first_output_marker}"
+  mkfifo "${output_fifo}"
+
+  (
+    while [[ ! -e "${first_output_marker}" ]]; do
+      sleep "${heartbeat_interval}" || break
+      if [[ ! -e "${first_output_marker}" ]]; then
+        printf 'startup_marker: torchrun_wait_first_output elapsed_s=%s\n' \
+          "$(elapsed_seconds "${start_epoch}")" | log_stream
+      fi
+    done
+  ) &
+  local heartbeat_pid=$!
+
+  log_child_stream "${start_epoch}" "${first_output_marker}" < "${output_fifo}" &
+  local logger_pid=$!
+
+  "$@" > "${output_fifo}" 2>&1
+  local command_rc=$?
+
+  wait "${logger_pid}" 2>/dev/null || true
+  kill "${heartbeat_pid}" 2>/dev/null || true
+  wait "${heartbeat_pid}" 2>/dev/null || true
+  rm -f "${output_fifo}" "${first_output_marker}"
+  return "${command_rc}"
+}
+
+completion_guard() {
+  if [[ "${DISABLE_COMPLETION_GUARD:-0}" == "1" ]]; then
+    return 0
+  fi
+  local summary_path="${LOG_DIR}/run_summary.json"
+  if [[ ! -f "${summary_path}" ]]; then
+    return 0
+  fi
+
+  local guard_status
+  set +e
+  python3 - "${summary_path}" <<'PY'
+import json
+import os
+import sys
+
+summary_path = sys.argv[1]
+try:
+    with open(summary_path, 'r', encoding='utf-8') as f:
+        summary = json.load(f)
+except Exception as exc:
+    print(f"[WARN] completion_guard: cannot read {summary_path}: {exc}")
+    raise SystemExit(0)
+
+iteration = summary.get('iteration')
+train_iters = summary.get('train_iters')
+checkpoint = summary.get('last_model_checkpoint')
+try:
+    iteration_int = int(iteration)
+    train_iters_int = int(train_iters)
+except (TypeError, ValueError):
+    raise SystemExit(0)
+
+if iteration_int >= train_iters_int and checkpoint and os.path.isdir(checkpoint):
+    print(
+        "[INFO] completion_guard: existing run is complete; "
+        f"iteration={iteration_int} train_iters={train_iters_int} checkpoint={checkpoint}"
+    )
+    raise SystemExit(42)
+
+raise SystemExit(0)
+PY
+  guard_status=$?
+  set -e
+  if [[ "${guard_status}" == "42" ]]; then
+    return 42
+  fi
+  return 0
 }
 
 training_args=(
@@ -354,6 +506,7 @@ training_args=(
   --save_safetensors "${SAVE_SAFETENSORS}"
   --load_from_cache_file "${LOAD_FROM_CACHE_FILE}"
   --split_dataset_ratio "${SPLIT_DATASET_RATIO}"
+  --dataset_shuffle "${DATASET_SHUFFLE}"
   --torch_dtype bfloat16
   --max_length "${MAX_LENGTH}"
   --truncation_strategy "${TRUNCATION_STRATEGY}"
@@ -490,6 +643,7 @@ export SWIFT_RUN_NAME="${RUN_NAME}"
 export SWIFT_OUTPUT_DIR="${OUTPUT_DIR}"
 export SWIFT_LOG_DIR="${LOG_DIR}"
 export SWIFT_LOG_FILE="${LOG_FILE}"
+export SWIFT_STEP_METRICS_LOG_FILE="${SWIFT_STEP_METRICS_LOG_FILE:-${LOG_FILE}}"
 printf -v SWIFT_LAUNCH_COMMAND ' %q' "${cmd[@]}"
 export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
 
@@ -498,7 +652,11 @@ export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
   echo "Output dir: ${OUTPUT_DIR}"
   echo "Log dir: ${LOG_DIR}"
   echo "Log file: ${LOG_FILE}"
-  echo "Step metrics: ${LOG_DIR}/logging.jsonl"
+  if [[ "${SWIFT_DISABLE_LOGGING_JSONL:-0}" == "1" ]]; then
+    echo "Step metrics: ${SWIFT_STEP_METRICS_LOG_FILE:-${LOG_FILE}} (step_metrics_json lines)"
+  else
+    echo "Step metrics: ${LOG_DIR}/logging.jsonl"
+  fi
   echo "Run metadata: ${LOG_DIR}/run_metadata.json"
   echo "TensorBoard dir: ${LOG_DIR}/runs"
   echo "W&B local dir: ${LOG_DIR}/wandb"
@@ -522,12 +680,12 @@ export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
   echo "Optimizer CPU offload: ${OPTIMIZER_CPU_OFFLOAD} fraction=${OPTIMIZER_OFFLOAD_FRACTION} torch_optimizer=${USE_TORCH_OPTIMIZER_FOR_CPU_OFFLOAD} overlap_d2h_h2d=${OVERLAP_CPU_OPTIMIZER_D2H_H2D} pin_grads=${PIN_CPU_GRADS} pin_params=${PIN_CPU_PARAMS}"
   echo "Precision-aware optimizer: ${USE_PRECISION_AWARE_OPTIMIZER} main_grads=${MAIN_GRADS_DTYPE} main_params=${MAIN_PARAMS_DTYPE} exp_avg=${EXP_AVG_DTYPE} exp_avg_sq=${EXP_AVG_SQ_DTYPE}"
   echo "Cross entropy loss fusion: ${CROSS_ENTROPY_LOSS_FUSION}"
-  echo "Chunked linear CE: impl=${LINEAR_CE_IMPL} chunk_size=${LINEAR_CE_CHUNK_SIZE}"
+  echo "Chunked linear CE: impl=${LINEAR_CE_IMPL} chunk_size=${LINEAR_CE_CHUNK_SIZE} debug=${LINEAR_CE_DEBUG}"
   echo "Attention backend: ${ATTENTION_BACKEND}"
   echo "Vision attention implementation: ${VIT_ATTN_IMPL:-<auto>}"
   echo "Recompute: granularity=${RECOMPUTE_GRANULARITY} method=${RECOMPUTE_METHOD} num_layers=${RECOMPUTE_NUM_LAYERS} modules=${RECOMPUTE_MODULES:-<default>}"
   echo "Overlap: tp_comm=${TP_COMM_OVERLAP} grad_reduce=${OVERLAP_GRAD_REDUCE} param_gather=${OVERLAP_PARAM_GATHER} param_gather_with_step=${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP}"
-  echo "Data: data_sharding=${DATA_SHARDING} group_by_length=${GROUP_BY_LENGTH} packing=${PACKING} packing_length=${PACKING_LENGTH:-<auto>} padding_free=${PADDING_FREE} apply_rope_fusion=${APPLY_ROPE_FUSION} dataloader_pin_memory=${DATALOADER_PIN_MEMORY} persistent_workers=${DATALOADER_PERSISTENT_WORKERS}"
+  echo "Data: dataset_shuffle=${DATASET_SHUFFLE} data_sharding=${DATA_SHARDING} group_by_length=${GROUP_BY_LENGTH} packing=${PACKING} packing_length=${PACKING_LENGTH:-<auto>} padding_free=${PADDING_FREE} apply_rope_fusion=${APPLY_ROPE_FUSION} dataloader_pin_memory=${DATALOADER_PIN_MEMORY} persistent_workers=${DATALOADER_PERSISTENT_WORKERS}"
   echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER} linear_decoupled_in_proj=${LINEAR_DECOUPLED_IN_PROJ} gdn_pad_to_multiple=${MCORE_GDN_PAD_TO_FP8_MULTIPLE} gdn_disable_fp8_proj=${MCORE_GDN_DISABLE_FP8_PROJ}"
   echo "Gradient accumulation fusion: ${GRADIENT_ACCUMULATION_FUSION}"
   echo "Async save: ${ASYNC_SAVE}"
@@ -545,14 +703,46 @@ export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
   echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
   echo "Cache root: ${CACHE_ROOT}"
   echo "Local cache root: ${LOCAL_CACHE_ROOT}"
+  echo "Triton cache dir: ${TRITON_CACHE_DIR:-<default>}"
+  echo "Torch extensions dir: ${TORCH_EXTENSIONS_DIR:-<default>}"
   echo
   printf 'Command:'
   printf ' %q' "${cmd[@]}"
   echo
-} | timestamp_output | tee -a "${LOG_FILE}"
+} | log_stream
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   exit 0
 fi
 
-"${cmd[@]}" 2>&1 | timestamp_output | tee -a "${LOG_FILE}"
+guard_start_epoch="$(epoch_seconds)"
+echo "startup_marker: completion_guard_start" | log_stream
+set +e
+guard_output="$(completion_guard 2>&1)"
+guard_rc=$?
+set -e
+printf 'startup_marker: completion_guard_done duration_s=%s rc=%s\n' \
+  "$(elapsed_seconds "${guard_start_epoch}")" "${guard_rc}" | log_stream
+if [[ -n "${guard_output}" ]]; then
+  printf '%s\n' "${guard_output}" | log_stream
+fi
+if [[ "${guard_rc}" == "42" ]]; then
+  exit 0
+elif [[ "${guard_rc}" != "0" ]]; then
+  exit "${guard_rc}"
+fi
+
+cmd_start_epoch="$(epoch_seconds)"
+echo "startup_marker: torchrun_exec_start" | log_stream
+set +e
+run_command_with_heartbeat "${cmd_start_epoch}" "${cmd[@]}"
+cmd_rc=$?
+set -e
+printf 'startup_marker: torchrun_exec_done duration_s=%s rc=%s\n' \
+  "$(elapsed_seconds "${cmd_start_epoch}")" "${cmd_rc}" | log_stream
+
+{
+  echo "Command exit code: ${cmd_rc}"
+  echo "Command finished at: $(date -Is)"
+} | log_stream
+exit "${cmd_rc}"
