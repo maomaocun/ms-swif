@@ -116,7 +116,9 @@ DATASET_SHUFFLE="${DATASET_SHUFFLE:-true}"
 # Default to full activation recompute for long trajectory SFT memory headroom.
 # num_layers=1 means no layer interval.
 #   RECOMPUTE_GRANULARITY=full RECOMPUTE_METHOD=uniform RECOMPUTE_NUM_LAYERS=1 RECOMPUTE_MODULES=""
-RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-full}"
+if [[ -z "${RECOMPUTE_GRANULARITY+x}" ]]; then
+  RECOMPUTE_GRANULARITY="full"
+fi
 if [[ -z "${RECOMPUTE_METHOD+x}" ]]; then
   if [[ "${RECOMPUTE_GRANULARITY}" == "full" ]]; then
     RECOMPUTE_METHOD="uniform"
@@ -190,7 +192,7 @@ WANDB_EXP_NAME="${WANDB_EXP_NAME:-${WANDB_NAME:-${RUN_NAME}}}"
 WANDB_API_KEY_FILE="${WANDB_API_KEY_FILE:-/mnt/cpfs/yangyicun/.secrets/wandb_api_key}"
 DIRECT_TORCHRUN="${DIRECT_TORCHRUN:-true}"
 SKIP_FINAL_SAVE="${SKIP_FINAL_SAVE:-${BENCHMARK_SKIP_FINAL_SAVE:-false}}"
-MEGATRON_PYTHON="${MEGATRON_PYTHON:-${SCRIPT_DIR}/.venv-megatron/bin/python}"
+MEGATRON_PYTHON="${MEGATRON_PYTHON:-$(command -v python3)}"
 MEGATRON_SFT_ENTRY="${MEGATRON_SFT_ENTRY:-${SCRIPT_DIR}/swift/cli/_megatron/sft.py}"
 USE_MCORE_GDN="${USE_MCORE_GDN:-true}"
 
@@ -448,6 +450,17 @@ run_command_with_heartbeat() {
   return "${command_rc}"
 }
 
+run_command_direct() {
+  local start_epoch="$1"
+  shift
+  if command -v stdbuf >/dev/null 2>&1; then
+    stdbuf -oL -eL "$@" 2>&1 | log_child_stream "${start_epoch}" ""
+  else
+    "$@" 2>&1 | log_child_stream "${start_epoch}" ""
+  fi
+  return "${PIPESTATUS[0]}"
+}
+
 completion_guard() {
   if [[ "${DISABLE_COMPLETION_GUARD:-0}" == "1" ]]; then
     return 0
@@ -523,7 +536,6 @@ training_args=(
   --padding_free "${PADDING_FREE}"
   --apply_rope_fusion "${APPLY_ROPE_FUSION}"
   --lazy_tokenize "${LAZY_TOKENIZE}"
-  --recompute_granularity "${RECOMPUTE_GRANULARITY}"
   --finetune true
   --cross_entropy_loss_fusion "${CROSS_ENTROPY_LOSS_FUSION}"
   --gradient_accumulation_fusion "${GRADIENT_ACCUMULATION_FUSION}"
@@ -587,6 +599,9 @@ if [[ -n "${PACKING_LENGTH}" ]]; then
   training_args+=(--packing_length "${PACKING_LENGTH}")
 fi
 
+if [[ -n "${RECOMPUTE_GRANULARITY}" ]]; then
+  training_args+=(--recompute_granularity "${RECOMPUTE_GRANULARITY}")
+fi
 if [[ -n "${RECOMPUTE_METHOD}" ]]; then
   training_args+=(--recompute_method "${RECOMPUTE_METHOD}")
 fi
@@ -683,7 +698,7 @@ export SWIFT_LAUNCH_COMMAND="${SWIFT_LAUNCH_COMMAND# }"
   echo "Chunked linear CE: impl=${LINEAR_CE_IMPL} chunk_size=${LINEAR_CE_CHUNK_SIZE} debug=${LINEAR_CE_DEBUG}"
   echo "Attention backend: ${ATTENTION_BACKEND}"
   echo "Vision attention implementation: ${VIT_ATTN_IMPL:-<auto>}"
-  echo "Recompute: granularity=${RECOMPUTE_GRANULARITY} method=${RECOMPUTE_METHOD} num_layers=${RECOMPUTE_NUM_LAYERS} modules=${RECOMPUTE_MODULES:-<default>}"
+  echo "Recompute: granularity=${RECOMPUTE_GRANULARITY:-<off>} method=${RECOMPUTE_METHOD:-<off>} num_layers=${RECOMPUTE_NUM_LAYERS:-<off>} modules=${RECOMPUTE_MODULES:-<off>}"
   echo "Overlap: tp_comm=${TP_COMM_OVERLAP} grad_reduce=${OVERLAP_GRAD_REDUCE} param_gather=${OVERLAP_PARAM_GATHER} param_gather_with_step=${OVERLAP_PARAM_GATHER_WITH_OPTIMIZER_STEP}"
   echo "Data: dataset_shuffle=${DATASET_SHUFFLE} data_sharding=${DATA_SHARDING} group_by_length=${GROUP_BY_LENGTH} packing=${PACKING} packing_length=${PACKING_LENGTH:-<auto>} padding_free=${PADDING_FREE} apply_rope_fusion=${APPLY_ROPE_FUSION} dataloader_pin_memory=${DATALOADER_PIN_MEMORY} persistent_workers=${DATALOADER_PERSISTENT_WORKERS}"
   echo "FP8: format=${FP8_FORMAT:-<off>} recipe=${FP8_RECIPE} param_gather=${FP8_PARAM_GATHER} linear_decoupled_in_proj=${LINEAR_DECOUPLED_IN_PROJ} gdn_pad_to_multiple=${MCORE_GDN_PAD_TO_FP8_MULTIPLE} gdn_disable_fp8_proj=${MCORE_GDN_DISABLE_FP8_PROJ}"
@@ -735,7 +750,18 @@ fi
 cmd_start_epoch="$(epoch_seconds)"
 echo "startup_marker: torchrun_exec_start" | log_stream
 set +e
-run_command_with_heartbeat "${cmd_start_epoch}" "${cmd[@]}"
+case "${REALTIME_LOG_MODE:-direct}" in
+  direct)
+    run_command_direct "${cmd_start_epoch}" "${cmd[@]}"
+    ;;
+  heartbeat)
+    run_command_with_heartbeat "${cmd_start_epoch}" "${cmd[@]}"
+    ;;
+  *)
+    echo "ERROR: REALTIME_LOG_MODE must be 'direct' or 'heartbeat'." | log_stream
+    exit 1
+    ;;
+esac
 cmd_rc=$?
 set -e
 printf 'startup_marker: torchrun_exec_done duration_s=%s rc=%s\n' \
