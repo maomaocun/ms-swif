@@ -69,6 +69,7 @@ class Template(ProcessorMixin):
     jinja_enable_thinking_key = 'enable_thinking'
 
     is_encoder_decoder = False
+    _collator_control_keys = {'pad_target_length'}
 
     def __init__(
         self,
@@ -630,6 +631,9 @@ class Template(ProcessorMixin):
         for encoded in batched:
             if chosen.channel is not None:
                 encoded['channel'] = chosen.channel
+            for key in self._collator_control_keys:
+                if key in chosen.extra_kwargs:
+                    encoded[key] = chosen.extra_kwargs[key]
 
             lengths = []
             for key in list(encoded.keys()):
@@ -675,6 +679,66 @@ class Template(ProcessorMixin):
 
         packed.update(self._data_collator_mm_data(row))
         return packed
+
+    @staticmethod
+    def _to_int_scalar(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            if value.numel() == 0:
+                return None
+            return int(value.max().item())
+        if isinstance(value, (list, tuple)):
+            values = [Template._to_int_scalar(item) for item in value]
+            values = [item for item in values if item is not None]
+            return max(values) if values else None
+        return int(value)
+
+    @classmethod
+    def _get_pad_target_length(cls, batch: List[Dict[str, Any]]) -> Optional[int]:
+        targets = []
+        for row in batch:
+            value = row.get('pad_target_length')
+            if value is None:
+                extra_kwargs = row.get('_extra_kwargs')
+                if isinstance(extra_kwargs, dict):
+                    value = extra_kwargs.get('pad_target_length')
+            value = cls._to_int_scalar(value)
+            if value is not None:
+                targets.append(value)
+        return max(targets) if targets else None
+
+    @staticmethod
+    def _resolve_padding_to(seq_lens: List[int], padding_to: Optional[int],
+                            pad_target_length: Optional[int]) -> Optional[int]:
+        max_seq_len = max(seq_lens)
+        if pad_target_length is not None:
+            target = max(max_seq_len, pad_target_length)
+            if padding_to is not None:
+                target = math.ceil(target / padding_to) * padding_to
+            return target
+        if padding_to is not None:
+            return math.ceil(max_seq_len / padding_to) * padding_to
+        return None
+
+    @staticmethod
+    def _pad_padding_free_position_ids(position_ids: torch.Tensor, padding_len: int,
+                                       padding_right: bool) -> torch.Tensor:
+        if padding_len <= 0:
+            return position_ids
+        if not padding_right:
+            return F.pad(position_ids, (padding_len, 0), 'constant', 0)
+        if position_ids.ndim == 1:
+            start = int(position_ids[-1].item()) + 1 if position_ids.numel() > 0 else 0
+            pad = torch.arange(start, start + padding_len, dtype=position_ids.dtype, device=position_ids.device)
+            return torch.concat([position_ids, pad], dim=-1)
+        if position_ids.ndim == 3:
+            last = position_ids[..., -1:] if position_ids.shape[-1] > 0 else position_ids.new_zeros(
+                (*position_ids.shape[:-1], 1))
+            increments = torch.arange(1, padding_len + 1, dtype=position_ids.dtype, device=position_ids.device)
+            pad = last + increments.view(*([1] * (position_ids.ndim - 1)), padding_len)
+            return torch.concat([position_ids, pad], dim=-1)
+        return F.pad(position_ids, (0, padding_len), 'constant', 0)
 
     def _post_encode(self, model: nn.Module, inputs: Dict[str, Any]) -> Dict[str, Any]:
         return inputs
@@ -1641,7 +1705,7 @@ class Template(ProcessorMixin):
         if not self.remove_unused_columns:
             extra_kwargs = [b['_extra_kwargs'] for b in batch if b.get('_extra_kwargs') is not None]
             extra_kwargs = RowPreprocessor.rows_to_batched(extra_kwargs)
-            res.update({k: v for k, v in extra_kwargs.items() if k not in res})
+            res.update({k: v for k, v in extra_kwargs.items() if k not in res and k not in self._collator_control_keys})
         if 'num_samples' in res:
             num_samples = res.pop('num_samples')
         if self.use_megatron:
@@ -1825,6 +1889,7 @@ class Template(ProcessorMixin):
         padding_side = self.padding_side if self.is_training else 'left'
         padding_right = padding_side == 'right'
         self._handle_megatron_cp(batch)
+        pad_target_length = self._get_pad_target_length(batch)
         if self.padding_free:
             batch[:] = [self.packing_row(batch)]
             assert 'position_ids' in batch[0], f'batch[0]: {batch[0]}'
@@ -1886,8 +1951,7 @@ class Template(ProcessorMixin):
 
         if self.use_megatron:
             # For code simplicity, only the attention_backend 'flash' is supported here.
-            if padding_to is not None:
-                padding_to = math.ceil(max(seq_lens) / padding_to) * padding_to
+            padding_to = self._resolve_padding_to(seq_lens, padding_to, pad_target_length)
             if self.padding_free:
                 cp_size = self.sequence_parallel_size
                 if cp_size > 1:
@@ -1916,8 +1980,11 @@ class Template(ProcessorMixin):
                                                and self.sequence_parallel_size > 1):
                 padding_len = padding_to - seq_lens[0]
                 if padding_len > 0:
-                    res[key][0] = F.pad(res[key][0], (0, padding_len) if padding_right else (padding_len, 0),
-                                        'constant', pad_value)
+                    if self.padding_free and key == 'position_ids':
+                        res[key][0] = self._pad_padding_free_position_ids(res[key][0], padding_len, padding_right)
+                    else:
+                        res[key][0] = F.pad(res[key][0], (0, padding_len) if padding_right else (padding_len, 0),
+                                            'constant', pad_value)
             if key == 'position_ids' and res[key][0].ndim == 3:
                 res[key] = self._pad_3d_position_ids(res[key], pad_value)
             else:
