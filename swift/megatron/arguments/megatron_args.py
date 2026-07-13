@@ -703,6 +703,10 @@ class MegatronArguments(RLHFMegatronArgumentsMixin, MegatronTunerMixin):
             self.recompute_granularity = None
         if self.recompute_granularity == 'selective' and self.recompute_method is not None:
             raise ValueError('recompute method is not yet supported for selective recomputing granularity')
+        if self.recompute_granularity != 'selective':
+            self.recompute_modules = []
+        if self.dataset_shuffle is not None:
+            self.train_dataloader_shuffle = self.dataset_shuffle
 
         if self.group_by_length and self.padding_free:
             raise ValueError('group_by_length is not compatible with padding_free.')
